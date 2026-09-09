@@ -1,0 +1,48 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: claudex_chat_prod
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d claudex_chat_prod"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${PORT:-4000}:4000"
+    environment:
+      DATABASE_URL: ecto://postgres:postgres@db/claudex_chat_prod
+
+      # Without a key the app still starts and says so in the UI.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+
+      # Throwaway value so `docker compose up` works with no setup. Generate
+      # your own with `mix phx.gen.secret` for anything that isn't local.
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:-oLpM+6HoUoLEQIfoJnuf5lPpuSlb7PYXtCVlNJJtTfKOc8nc4ZE8YLn2XFxkHLrl}
+
+      # Serve plain http on 4000 rather than the production https default, so
+      # the LiveView websocket passes the endpoint's origin check.
+      PHX_HOST: localhost
+      PHX_SCHEME: http
+      PHX_URL_PORT: "4000"
+      PORT: "4000"
+
+      # What the file tools can see. The container has its own filesystem, so
+      # only what is mounted below exists as far as Claude is concerned.
+      CLAUDEX_CHAT_ROOT: /workspace
+    volumes:
+      - ${CLAUDEX_CHAT_WORKSPACE:-./workspace}:/workspace
+    command: ["sh", "-c", "/app/bin/migrate && /app/bin/server"]
+
+volumes:
+  pgdata:

@@ -10,12 +10,29 @@ the browser open.
 
 ## Requirements
 
+Either Docker, or:
+
 - Elixir 1.19 / OTP 28
 - PostgreSQL on `localhost:5432`, reachable as `postgres`/`postgres`
   (change the host and port in `config/dev.exs` and `config/test.exs`)
-- An Anthropic API key
 
-## Running it
+An Anthropic API key either way, though the app starts without one and says so.
+
+## Running it with Docker
+
+```sh
+cp .env.example .env      # add your ANTHROPIC_API_KEY
+docker compose up
+```
+
+Then open <http://localhost:4000>. Postgres, migrations and asset building are
+all handled; nothing needs installing but Docker.
+
+The container has its own filesystem, so the file tools can only see what you
+mount. `./workspace` is mounted at `/workspace` by default — set
+`CLAUDEX_CHAT_WORKSPACE` in `.env` to point Claude at a real project instead.
+
+## Running it locally
 
 ```sh
 mix setup

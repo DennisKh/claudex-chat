@@ -38,3 +38,7 @@ npm-debug.log
 
 # Machine-local config, including the Claude API key.
 /config/*.local.exs
+
+# Local workspace contents (the directory itself is kept)
+/workspace/*
+!/workspace/README.md

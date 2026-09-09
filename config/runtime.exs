@@ -30,8 +30,17 @@ config :claudex, receive_timeout: :timer.minutes(10)
 # config/dev.local.exs, which is loaded earlier.
 #
 # With neither source the app still boots and says so in the UI.
-if api_key = System.get_env("ANTHROPIC_API_KEY") do
-  config :claudex, api_key: api_key
+# An unset variable and one set to "" both mean "no key" — Docker Compose
+# passes the empty string when the host has none, and "" is truthy in Elixir.
+case System.get_env("ANTHROPIC_API_KEY") do
+  key when is_binary(key) and key != "" -> config :claudex, api_key: key
+  _no_key -> :ok
+end
+
+# Where the file tools resolve relative paths. In a container this is the
+# mounted workspace; on a dev machine config/dev.exs already set it.
+if root = System.get_env("CLAUDEX_CHAT_ROOT") do
+  config :claudex_chat, default_root: root
 end
 
 if config_env() == :dev do
@@ -83,10 +92,15 @@ if config_env() == :prod do
 
   host = System.get_env("PHX_HOST") || "example.com"
 
+  # https on 443 unless told otherwise, so a local container can serve plain
+  # http without failing the endpoint's origin check on the websocket.
+  url_scheme = System.get_env("PHX_SCHEME") || "https"
+  url_port = String.to_integer(System.get_env("PHX_URL_PORT") || "443")
+
   config :claudex_chat, :dns_cluster_query, System.get_env("DNS_CLUSTER_QUERY")
 
   config :claudex_chat, ClaudexChatWeb.Endpoint,
-    url: [host: host, port: 443, scheme: "https"],
+    url: [host: host, port: url_port, scheme: url_scheme],
     http: [
       # Enable IPv6 and bind on all interfaces.
       # Set it to  {0, 0, 0, 0, 0, 0, 0, 1} for local network only access.
