@@ -97,3 +97,7 @@ real recorded API payloads, copied from the SDK's own test suite.
 
 See `CLAUDE.md` for the project's engineering rules and `AGENTS.md` for the
 Phoenix and LiveView house style.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
