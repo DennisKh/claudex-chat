@@ -41,8 +41,7 @@ defmodule ClaudexChat.MixProject do
   defp deps do
     [
       {:phoenix, "~> 1.8.13"},
-      {:claudex, path: "/private/var/www/claude_projects/claudex"},
-      # {:claudex, "~> 0.6"},
+      {:claudex, "~> 0.10"},
       {:mdex, "~> 0.13.5"},
       {:phoenix_ecto, "~> 4.5"},
       {:ecto_sql, "~> 3.13"},
@@ -70,6 +69,8 @@ defmodule ClaudexChat.MixProject do
        depth: 1},
       {:swoosh, "~> 1.16"},
       {:req, "~> 0.5"},
+      {:opentelemetry, "~> 1.7"},
+      {:opentelemetry_exporter, "~> 1.11"},
       {:telemetry_metrics, "~> 1.0"},
       {:telemetry_poller, "~> 1.0"},
       {:gettext, "~> 1.0"},

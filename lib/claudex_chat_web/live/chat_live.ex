@@ -13,12 +13,15 @@ defmodule ClaudexChatWeb.ChatLive do
 
   import ClaudexChatWeb.ChatLive.Components
 
+  alias Claudex.Tracing
+
   alias ClaudexChat.{Approvals, Attachments, Chats, Claude, Completions, Models}
   alias ClaudexChat.Chats.Message
   alias ClaudexChat.Completions.Reply
   alias ClaudexChat.Models.Model
 
   @accept ~w(.png .jpg .jpeg .gif .webp .pdf .txt .md)
+  @max_resumes 10
   @max_file_size 20_000_000
 
   @impl Phoenix.LiveView
@@ -38,7 +41,11 @@ defmodule ClaudexChatWeb.ChatLive do
        reply: nil,
        handle: nil,
        awaiting_message: nil,
-       content: ""
+       resumes: 0,
+       content: "",
+       mcp_servers: [],
+       mcp_menu_open: false,
+       exchange_span: nil
      )
      |> stream(:chats, Chats.list_chats())
      |> stream(:messages, [])
@@ -86,6 +93,16 @@ defmodule ClaudexChatWeb.ChatLive do
     {:noreply, apply_settings(socket, socket.assigns.model, mode)}
   end
 
+  def handle_event("toggle_mcp_menu", _params, socket) do
+    {:noreply, update(socket, :mcp_menu_open, &(!&1))}
+  end
+
+  def handle_event("toggle_mcp", %{"name" => name}, socket) do
+    servers = toggle_membership(socket.assigns.mcp_servers, name)
+
+    {:noreply, socket |> apply_mcp_servers(servers) |> assign(:mcp_menu_open, false)}
+  end
+
   def handle_event("send", %{"content" => content}, socket) do
     if String.trim(content) == "" do
       {:noreply, socket}
@@ -114,9 +131,10 @@ defmodule ClaudexChatWeb.ChatLive do
          {:ok, %{message: message, chat: chat}} <- Chats.replay_user_message(chat, original) do
       {:noreply,
        socket
-       |> assign(:chat, chat)
+       |> assign(chat: chat, resumes: 0)
        |> stream_insert(:messages, message)
        |> stream_insert(:chats, chat, at: 0)
+       |> begin_exchange(chat)
        |> start_stream(chat)}
     else
       _not_replayable -> {:noreply, socket}
@@ -134,8 +152,9 @@ defmodule ClaudexChatWeb.ChatLive do
 
       {:noreply,
        socket
-       |> assign(awaiting_message: nil, reply: nil)
+       |> assign(awaiting_message: nil, reply: nil, resumes: 0)
        |> stream(:messages, Chats.list_messages(chat), reset: true)
+       |> begin_exchange(chat)
        |> start_stream(chat)}
     else
       _not_retryable -> {:noreply, socket}
@@ -171,11 +190,13 @@ defmodule ClaudexChatWeb.ChatLive do
   end
 
   def handle_info({:claudex, ref, :cancelled}, %{assigns: %{handle: %{ref: ref}}} = socket) do
-    {:noreply, store_reply(socket, Completions.cancelled(socket.assigns.reply))}
+    {:noreply, store_reply(socket, Reply.cancelled(socket.assigns.reply))}
   end
 
   def handle_info({:claudex, ref, {:error, error}}, %{assigns: %{handle: %{ref: ref}}} = socket) do
-    {:noreply, store_reply(socket, Completions.fail(socket.assigns.reply, error))}
+    reply = Completions.fail(socket.assigns.reply, error)
+
+    {:noreply, store_reply(socket, reply)}
   end
 
   def handle_info({:claudex, _stale_ref, _message}, socket), do: {:noreply, socket}
@@ -185,7 +206,15 @@ defmodule ClaudexChatWeb.ChatLive do
     messages = Chats.list_messages(chat)
 
     socket
-    |> assign(chat: chat, model: model, thinking_mode: chat.thinking_mode, page_title: chat.title)
+    |> discard_exchange()
+    |> assign(
+      chat: chat,
+      model: model,
+      thinking_mode: chat.thinking_mode,
+      mcp_servers: chat.mcp_servers,
+      mcp_menu_open: false,
+      page_title: chat.title
+    )
     |> assign(awaiting_message: awaiting_message(messages), reply: nil, handle: nil)
     |> stream(:messages, messages, reset: true)
     |> stream(:chats, Chats.list_chats(), reset: true)
@@ -193,6 +222,7 @@ defmodule ClaudexChatWeb.ChatLive do
 
   defp close_chat(socket) do
     socket
+    |> discard_exchange()
     |> assign(chat: nil, reply: nil, handle: nil, awaiting_message: nil, page_title: "Chat")
     |> stream(:messages, [], reset: true)
     |> stream(:chats, Chats.list_chats(), reset: true)
@@ -206,13 +236,44 @@ defmodule ClaudexChatWeb.ChatLive do
         socket
 
       chat ->
-        {:ok, chat} = Chats.update_chat(chat, settings_attrs(model, mode))
+        {:ok, chat} =
+          Chats.update_chat(chat, settings_attrs(model, mode, socket.assigns.mcp_servers))
+
         socket |> assign(:chat, chat) |> stream_insert(:chats, chat)
     end
   end
 
-  defp settings_attrs(model, mode) do
-    %{model: model.id, thinking_mode: mode, thinking_budget: thinking_budget(mode)}
+  # Membership only, not the menu — a chat can be closed and reopened, but
+  # what it's enabled stays whatever it was.
+  defp apply_mcp_servers(socket, servers) do
+    socket = assign(socket, :mcp_servers, servers)
+
+    case socket.assigns.chat do
+      nil ->
+        socket
+
+      chat ->
+        {:ok, chat} =
+          Chats.update_chat(
+            chat,
+            settings_attrs(socket.assigns.model, socket.assigns.thinking_mode, servers)
+          )
+
+        socket |> assign(:chat, chat) |> stream_insert(:chats, chat)
+    end
+  end
+
+  defp toggle_membership(names, name) do
+    if name in names, do: List.delete(names, name), else: [name | names]
+  end
+
+  defp settings_attrs(model, mode, mcp_servers) do
+    %{
+      model: model.id,
+      thinking_mode: mode,
+      thinking_budget: thinking_budget(mode),
+      mcp_servers: mcp_servers
+    }
   end
 
   defp supported_mode(model, mode) do
@@ -223,6 +284,7 @@ defmodule ClaudexChatWeb.ChatLive do
   defp thinking_budget(_mode), do: nil
 
   defp send_prompt(socket, content) do
+    socket = assign(socket, :resumes, 0)
     {:ok, chat} = ensure_chat(socket)
     attachments = consume_attachments(socket)
 
@@ -235,11 +297,18 @@ defmodule ClaudexChatWeb.ChatLive do
     |> stream_insert(:messages, message)
     |> stream_insert(:chats, chat, at: 0)
     |> push_event("chat:sent", %{})
+    |> begin_exchange(chat)
     |> start_stream(chat)
   end
 
   defp ensure_chat(%{assigns: %{chat: nil}} = socket) do
-    Chats.create_chat(settings_attrs(socket.assigns.model, socket.assigns.thinking_mode))
+    Chats.create_chat(
+      settings_attrs(
+        socket.assigns.model,
+        socket.assigns.thinking_mode,
+        socket.assigns.mcp_servers
+      )
+    )
   end
 
   defp ensure_chat(%{assigns: %{chat: chat}}), do: {:ok, chat}
@@ -250,9 +319,11 @@ defmodule ClaudexChatWeb.ChatLive do
         assign(socket, handle: handle, reply: Reply.new(chat.model))
 
       {:error, reason} ->
+        reply = Completions.fail(Reply.new(chat.model), reason)
+
         socket
         |> assign(handle: nil, reply: nil)
-        |> store_reply(Completions.fail(Reply.new(chat.model), reason))
+        |> store_reply(reply)
     end
   end
 
@@ -264,10 +335,10 @@ defmodule ClaudexChatWeb.ChatLive do
         socket
         |> assign(:chat, chat)
         |> stream_insert(:messages, message)
-        |> continue_awaiting(message)
+        |> continue_awaiting(message, reply)
 
       _ignored_or_failed ->
-        socket
+        discard_exchange(socket)
     end
   end
 
@@ -284,8 +355,78 @@ defmodule ClaudexChatWeb.ChatLive do
     end
   end
 
-  defp continue_awaiting(socket, message) do
-    assign(socket, :awaiting_message, if(Approvals.awaiting?(message), do: message))
+  # Three ways a reply can end: waiting on a human, paused by the API mid
+  # server-tool, or done. Only the first stops the conversation.
+  defp continue_awaiting(socket, message, reply) do
+    cond do
+      Approvals.awaiting?(message) ->
+        assign(socket, :awaiting_message, message)
+
+      Completions.paused?(message) ->
+        socket |> assign(:awaiting_message, nil) |> resume()
+
+      true ->
+        socket
+        |> end_exchange(message, reply)
+        |> assign(awaiting_message: nil, resumes: 0)
+    end
+  end
+
+  # One span covers everything between a prompt and its answer — every resume,
+  # every wait on a human — so the requests and the tool calls it took land in
+  # one trace rather than one each.
+  defp begin_exchange(socket, chat) do
+    params = Completions.params(chat, socket.assigns.model)
+
+    span =
+      Tracing.start_conversation(params, session: to_string(chat.id), max_turns: @max_resumes)
+
+    assign(socket, :exchange_span, span)
+  end
+
+  defp end_exchange(socket, message, reply) do
+    with_span(socket, fn span ->
+      if message.error, do: Tracing.set_error(span, message.error)
+
+      Tracing.end_conversation(span, Reply.message(reply), exchange_stop(message))
+    end)
+  end
+
+  # A stream the user stopped never carried a stop reason from the API, so the
+  # app supplied one. It has to translate that back: "cancelled" is not an API
+  # reason and the SDK can only read it as :unknown.
+  defp exchange_stop(%Message{stop_reason: "cancelled"}), do: :cancelled
+  defp exchange_stop(%Message{stop_reason: reason}), do: Claudex.Message.stop(reason)
+
+  # A chat closed or switched part-way leaves a span with no answer to record,
+  # only the fact that nobody is waiting for one. Closing it is what hands it
+  # to the exporter; dropping it exports nothing.
+  defp discard_exchange(socket),
+    do: with_span(socket, &Tracing.end_conversation(&1, nil, :abandoned))
+
+  defp with_span(socket, close) do
+    case socket.assigns.exchange_span do
+      nil ->
+        socket
+
+      span ->
+        close.(span)
+        assign(socket, :exchange_span, nil)
+    end
+  end
+
+  # A pause resends the history and carries on with nobody deciding anything,
+  # so it needs its own ceiling — an API that kept pausing would otherwise
+  # loop without end. The count is of pauses in a row: a turn that ends any
+  # other way clears it.
+  defp resume(socket) do
+    if socket.assigns.resumes < @max_resumes do
+      socket
+      |> update(:resumes, &(&1 + 1))
+      |> start_stream(socket.assigns.chat)
+    else
+      put_flash(socket, :error, "Claude paused #{@max_resumes} times in a row; stopped there.")
+    end
   end
 
   defp continue_or_wait(socket, message) do
@@ -293,7 +434,7 @@ defmodule ClaudexChatWeb.ChatLive do
       assign(socket, :awaiting_message, message)
     else
       socket
-      |> assign(:awaiting_message, nil)
+      |> assign(awaiting_message: nil, resumes: 0)
       |> start_stream(socket.assigns.chat)
     end
   end
@@ -401,6 +542,8 @@ defmodule ClaudexChatWeb.ChatLive do
           streaming={!is_nil(@handle)}
           disabled={!@api_configured? or not is_nil(@awaiting_message)}
           content={@content}
+          mcp_servers={@mcp_servers}
+          mcp_menu_open={@mcp_menu_open}
         />
       </main>
 

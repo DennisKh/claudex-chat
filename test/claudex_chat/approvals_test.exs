@@ -20,9 +20,12 @@ defmodule ClaudexChat.ApprovalsTest do
     {:ok, chat: chat, root: root}
   end
 
-  defp with_calls(chat, calls) do
+  defp with_calls(chat, calls, attrs \\ %{}) do
     {:ok, %{message: message}} =
-      Chats.add_assistant_message(chat, %{content: "on it", tool_calls: calls})
+      Chats.add_assistant_message(
+        chat,
+        Map.merge(%{content: "on it", tool_calls: calls}, attrs)
+      )
 
     message
   end
@@ -32,15 +35,35 @@ defmodule ClaudexChat.ApprovalsTest do
   end
 
   test "a call starts pending and blocks the turn", %{chat: chat} do
-    message = with_calls(chat, [call("read_file", %{"filename_or_path" => "a.txt"})])
+    message = with_calls(chat, [call("read_file", %{"path" => "a.txt"})])
 
     assert Approvals.awaiting?(message)
     assert [pending] = Approvals.pending(message)
     assert pending.status == "pending"
   end
 
+  test "a call from a turn that was cut off is never offered", %{chat: chat} do
+    message =
+      with_calls(chat, [call("read_file", %{})], %{stop_reason: "max_tokens"})
+
+    assert Approvals.pending(message) == []
+    refute Approvals.awaiting?(message)
+  end
+
+  test "approving a call the turn never confirmed does nothing", %{chat: chat, root: root} do
+    message =
+      with_calls(chat, [call("write_file", %{"path" => "new.txt", "content" => "x"})], %{
+        stop_reason: "refusal"
+      })
+
+    assert {:ok, message} = Approvals.approve(message, "toolu_1")
+    assert [untouched] = message.tool_calls
+    assert untouched.status == "pending"
+    refute File.exists?(Path.join(root, "new.txt"))
+  end
+
   test "approving runs the tool and records the output", %{chat: chat} do
-    message = with_calls(chat, [call("read_file", %{"filename_or_path" => "a.txt"})])
+    message = with_calls(chat, [call("read_file", %{"path" => "a.txt"})])
 
     assert {:ok, message} = Approvals.approve(message, "toolu_1")
     assert [resolved] = message.tool_calls
@@ -60,7 +83,7 @@ defmodule ClaudexChat.ApprovalsTest do
   end
 
   test "an approved call to a denied location is recorded as failed", %{chat: chat} do
-    message = with_calls(chat, [call("read_file", %{"filename_or_path" => "/etc/hosts"})])
+    message = with_calls(chat, [call("read_file", %{"path" => "/etc/hosts"})])
 
     assert {:ok, message} = Approvals.approve(message, "toolu_1")
     assert [resolved] = message.tool_calls
@@ -80,7 +103,7 @@ defmodule ClaudexChat.ApprovalsTest do
   test "approve_all resolves every pending call", %{chat: chat} do
     message =
       with_calls(chat, [
-        call("read_file", %{"filename_or_path" => "a.txt"}, "toolu_1"),
+        call("read_file", %{"path" => "a.txt"}, "toolu_1"),
         call("write_file", %{"path" => "b.txt", "content" => "hi"}, "toolu_2")
       ])
 
@@ -92,8 +115,8 @@ defmodule ClaudexChat.ApprovalsTest do
   test "deciding one call leaves the others pending", %{chat: chat} do
     message =
       with_calls(chat, [
-        call("read_file", %{"filename_or_path" => "a.txt"}, "toolu_1"),
-        call("read_file", %{"filename_or_path" => "a.txt"}, "toolu_2")
+        call("read_file", %{"path" => "a.txt"}, "toolu_1"),
+        call("read_file", %{"path" => "a.txt"}, "toolu_2")
       ])
 
     assert {:ok, message} = Approvals.approve(message, "toolu_1")

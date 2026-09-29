@@ -20,17 +20,28 @@ defmodule ClaudexChat.Tools do
   @max_entries 500
 
   # Which argument carries the path, per tool. One home for it, because the UI
-  # shows the path on the approval prompt and the names are not uniform.
+  # shows the path on the approval prompt and a tool is free to name the
+  # argument something other than "path".
   @path_arguments %{
-    "read_file" => "filename_or_path",
+    "read_file" => "path",
     "write_file" => "path",
     "edit_file" => "path",
     "list_files" => "path"
   }
 
-  @doc "The path a call is about, for showing on the approval prompt."
+  @doc """
+  The path a call is about, for showing on the approval prompt.
+
+  `nil` for a tool that has no path argument, or a call whose input is missing
+  it — the prompt says so rather than inventing one.
+  """
   @spec path_of(String.t(), map()) :: String.t() | nil
-  def path_of(tool, input) when is_map(input), do: input[@path_arguments[tool]]
+  def path_of(tool, input) when is_map(input) do
+    case @path_arguments[tool] do
+      nil -> nil
+      argument -> input[argument]
+    end
+  end
 
   @doc """
   List the files and directories at a path on the user's machine.
@@ -43,7 +54,12 @@ defmodule ClaudexChat.Tools do
   and is not recursive; list a subdirectory to go deeper. System directories
   and credential stores are refused whatever the user approves.
   """
-  @tool true
+  @tool %{
+    args: [
+      path:
+        "Directory to list. Absolute, or relative to the project directory (\".\" for the project itself)."
+    ]
+  }
   @spec list_files(String.t()) :: String.t()
   def list_files(path) do
     dir = resolve!(path)
@@ -83,36 +99,41 @@ defmodule ClaudexChat.Tools do
   end
 
   @doc """
-  Read a UTF-8 text file from the user local machine workspace and return its full contents.
+  Read a text file on the user's machine and return its full contents.
 
-  Use this to read a file when user provide you a file name or a file path on his local filesystem.
+  Use this whenever an answer depends on what a file actually contains, and
+  always before editing one — never describe a file you have not read. The
+  file is already on this machine, so read it rather than asking the user to
+  paste or upload it.
 
-  Use this before editing a file, and whenever an answer depends on what a
-  file actually contains — never describe a file you have not read.
-
-  Relative paths resolve against the project directory. Files above 200,000 bytes are
-  refused rather than truncated, so the contents you get back are always the
-  whole file. This reads text; it does not decode images, PDFs or other
-  binaries.
+  Relative paths resolve against the project directory. This reads UTF-8 text;
+  it does not decode images, PDFs or other binaries, and a file above 200,000
+  bytes is refused rather than truncated, so what you get back is always the
+  whole file.
   """
-  @tool true
+  @tool %{
+    args: [
+      path:
+        "File to read. Absolute, or relative to the project directory (\"mix.exs\", \"lib/app.ex\")."
+    ]
+  }
   @spec read_file(String.t()) :: String.t()
-  def read_file(filename_or_path) do
-    file = resolve!(filename_or_path)
+  def read_file(path) do
+    file = resolve!(path)
 
     case File.stat(file) do
       {:ok, %File.Stat{type: :directory}} ->
-        raise Claudex.Tool.Error, "#{filename_or_path} is a directory, not a file"
+        raise Claudex.Tool.Error, "#{path} is a directory, not a file"
 
       {:ok, %File.Stat{size: size}} when size > @max_read_bytes ->
         raise Claudex.Tool.Error,
-              "#{filename_or_path} is #{size} bytes, over the #{@max_read_bytes} byte limit"
+              "#{path} is #{size} bytes, over the #{@max_read_bytes} byte limit"
 
       {:ok, _stat} ->
-        read!(file, filename_or_path)
+        read!(file, path)
 
       {:error, reason} ->
-        raise Claudex.Tool.Error, "can't read #{filename_or_path}: #{:file.format_error(reason)}"
+        raise Claudex.Tool.Error, "can't read #{path}: #{:file.format_error(reason)}"
     end
   end
 
@@ -128,7 +149,13 @@ defmodule ClaudexChat.Tools do
   instead. `content` is the complete final text of the file — not a fragment,
   a patch, or a diff.
   """
-  @tool true
+  @tool %{
+    args: [
+      path:
+        "File to write. Absolute, or relative to the project directory. Parent directories are created.",
+      content: "The complete final text of the file. Not a fragment, a patch, or a diff."
+    ]
+  }
   @spec write_file(String.t(), String.t()) :: String.t()
   def write_file(path, content) do
     file = resolve!(path)
@@ -156,7 +183,15 @@ defmodule ClaudexChat.Tools do
   literal text, not regular expressions and not diff syntax. To create a file,
   use `write_file`.
   """
-  @tool true
+  @tool %{
+    args: [
+      path: "File to edit. Absolute, or relative to the project directory.",
+      old_string:
+        "Exact text to replace, matching the file byte for byte including indentation. Must appear exactly once.",
+      new_string:
+        "Literal text to put in its place. Not a regular expression and not diff syntax."
+    ]
+  }
   @spec edit_file(String.t(), String.t(), String.t()) :: String.t()
   def edit_file(path, old_string, new_string) do
     file = resolve!(path)

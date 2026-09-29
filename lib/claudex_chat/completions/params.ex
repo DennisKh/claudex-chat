@@ -7,7 +7,7 @@ defmodule ClaudexChat.Completions.Params do
 
   alias ClaudexChat.Chats.{Chat, Message, ToolCall}
   alias ClaudexChat.Models.Model
-  alias ClaudexChat.{Paths, Tools}
+  alias ClaudexChat.{MCP, Paths, Tools}
 
   @max_tokens 16_384
   @image_types ~w(image/png image/jpeg image/gif image/webp)
@@ -15,9 +15,11 @@ defmodule ClaudexChat.Completions.Params do
   @doc """
   Builds the request body for the next reply in `chat`.
 
-  A reply that arrived with no content — a stream that failed or was cancelled
-  before any text — is left out of the history entirely; the API rejects a
-  message whose content is empty.
+  An assistant turn goes back as the API sent it, block for block, so a
+  thinking signature and a web search's encrypted results survive the round
+  trip. A reply that arrived with no content — a stream that failed or was
+  cancelled before any text — is left out of the history entirely; the API
+  rejects a message whose content is empty.
 
   Thinking is sent as the mode the model actually supports — `"adaptive"` on
   current models, `"enabled"` with a budget on Haiku 4.5 and older. `"off"`
@@ -26,16 +28,28 @@ defmodule ClaudexChat.Completions.Params do
 
   `display: "summarized"` is explicit because current models default to
   `"omitted"`, which streams thinking blocks with no text in them.
+
+  `cache_control` asks the API to cache the longest prefix it can and move
+  the breakpoint along as the chat grows, so a turn re-reads the history
+  instead of paying for it again. What makes that work is what this function
+  doesn't do: the system prompt and the tool list are the same bytes every
+  time, and a turn is only ever appended. Nothing here may start varying per
+  request — a timestamp in the system prompt would sit ahead of the whole
+  conversation and cache would never be read again.
   """
   @spec build(Chat.t(), [Message.t()], Model.t()) :: map()
   def build(%Chat{} = chat, history, %Model{} = model) do
+    mcp = MCP.request_params(chat.mcp_servers)
+
     %{
       model: chat.model,
       max_tokens: min(@max_tokens, model.max_output_tokens),
       messages: Enum.flat_map(history, &to_param(&1, chat.model)),
-      tools: tools(model),
-      system: system()
+      tools: tools(model, Map.get(mcp, :tools, [])),
+      system: system(),
+      cache_control: %{type: "ephemeral"}
     }
+    |> put_mcp_servers(mcp)
     |> put_thinking(chat, model)
   end
 
@@ -78,20 +92,29 @@ defmodule ClaudexChat.Completions.Params do
   end
 
   @doc """
-  The tools offered for this model: the local file tools, plus Anthropic's
-  hosted web search.
+  The tools offered for this model: the local file tools and Anthropic's
+  hosted web search. Same as `tools/2` with no MCP toolsets.
 
   Web search comes in two forms and the model decides which. The newer one
   runs code behind the scenes, so it's offered only to models whose
   capabilities report code execution — Haiku 4.5 rejects it outright.
   """
   @spec tools(Model.t()) :: [module() | map()]
-  def tools(%Model{} = model) do
-    [Tools, %{type: web_search_type(model), name: "web_search"}]
+  def tools(%Model{} = model), do: tools(model, [])
+
+  @doc "The tools offered for this model, plus one `mcp_toolset` per server `MCP.request_params/1` built."
+  @spec tools(Model.t(), [map()]) :: [module() | map()]
+  def tools(%Model{} = model, mcp_toolsets) do
+    [Tools, %{type: web_search_type(model), name: "web_search"}] ++ mcp_toolsets
   end
 
   defp web_search_type(%Model{accepts_code_execution: true}), do: "web_search_20260209"
   defp web_search_type(%Model{}), do: "web_search_20250305"
+
+  defp put_mcp_servers(params, %{mcp_servers: servers}),
+    do: Map.put(params, :mcp_servers, servers)
+
+  defp put_mcp_servers(params, %{}), do: params
 
   defp put_thinking(params, %Chat{thinking_mode: "adaptive"}, %Model{} = model) do
     if Model.supports_thinking?(model, "adaptive") do
@@ -122,19 +145,49 @@ defmodule ClaudexChat.Completions.Params do
   end
 
   defp to_param(%Message{role: "assistant"} = message, model) do
-    content =
-      thinking_block(message, model) ++
-        text_blocks(message.content) ++ tool_use_blocks(message)
-
-    case content do
+    case assistant_content(message, model) do
       [] -> []
       content -> [Claudex.Message.assistant(content)] ++ tool_result_param(message)
     end
   end
 
-  defp tool_use_blocks(%Message{tool_calls: tool_calls}) do
-    for call <- tool_calls do
-      block(%ContentBlock.ToolUse{id: call.call_id, name: call.name, input: call.input})
+  # A stored turn goes back as the API sent it, block for block: a web search
+  # the API ran for itself is only resumable with its own blocks in place, and
+  # they can't be rebuilt from the columns beside them. A message stored before
+  # those blocks were kept is reassembled from what there is.
+  defp assistant_content(%Message{content_blocks: []} = message, model) do
+    thinking_block(message, model) ++ text_blocks(message.content) ++ tool_use_blocks(message)
+  end
+
+  defp assistant_content(%Message{content_blocks: blocks} = message, model) do
+    Enum.filter(blocks, &replayable?(&1, message, model))
+  end
+
+  # Thinking is dropped when it came from another model, which the API rejects,
+  # or when the stream stopped before the signature that closes it arrived.
+  defp replayable?(%{"type" => "thinking"} = block, %Message{model: model}, current_model) do
+    model == current_model and block["signature"] not in [nil, ""]
+  end
+
+  defp replayable?(%{"type" => "redacted_thinking"}, %Message{model: model}, current_model) do
+    model == current_model
+  end
+
+  defp replayable?(%{"type" => "text"} = block, _message, _model),
+    do: block["text"] not in [nil, ""]
+
+  defp replayable?(%{"type" => "tool_use"}, %Message{} = message, _model),
+    do: Message.tool_calls_runnable?(message)
+
+  defp replayable?(_block, _message, _model), do: true
+
+  defp tool_use_blocks(%Message{} = message) do
+    if Message.tool_calls_runnable?(message) do
+      for call <- message.tool_calls do
+        block(%ContentBlock.ToolUse{id: call.call_id, name: call.name, input: call.input})
+      end
+    else
+      []
     end
   end
 
@@ -174,19 +227,17 @@ defmodule ClaudexChat.Completions.Params do
   defp thinking_block(_message, _model), do: []
 
   defp attachment_blocks(%Message{attachments: attachments}) do
-    Enum.map(attachments, fn attachment ->
-      %{
-        type: block_type(attachment.mime_type),
-        source: %{type: "file", file_id: attachment.file_id}
-      }
-    end)
+    Enum.map(attachments, &block(attachment_block(&1)))
   end
 
-  # Content blocks are built as SDK structs and converted here, so the wire
-  # shape stays the SDK's to define. Attachments have no struct — the API takes
-  # those blocks verbatim.
-  defp block(content_block), do: ContentBlock.to_param(content_block)
+  defp attachment_block(%{mime_type: mime_type, file_id: file_id})
+       when mime_type in @image_types do
+    ContentBlock.Image.file(file_id)
+  end
 
-  defp block_type(mime_type) when mime_type in @image_types, do: "image"
-  defp block_type(_mime_type), do: "document"
+  defp attachment_block(%{file_id: file_id}), do: ContentBlock.Document.file(file_id)
+
+  # Every block is built as an SDK struct and converted here, so the wire shape
+  # stays the SDK's to define.
+  defp block(content_block), do: ContentBlock.to_param(content_block)
 end

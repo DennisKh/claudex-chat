@@ -24,21 +24,49 @@ defmodule ClaudexChat.Completions do
   alias ClaudexChat.Chats.{Chat, Message}
   alias ClaudexChat.Claude
   alias ClaudexChat.Completions.{Params, Reply}
-  alias ClaudexChat.Models
+  alias ClaudexChat.{MCP, Models}
 
   @doc """
   Starts streaming the next reply for `chat`.
 
   The stream runs in a process linked to the caller, so it dies with the
   LiveView that asked for it.
+
+  The chat's id goes along as the session, which is what groups every request
+  in one conversation under a single trace in a tracing backend.
   """
   @spec start(Chat.t()) :: {:ok, Handle.t()} | {:error, term()}
   def start(%Chat{} = chat) do
-    with {:ok, client} <- Claude.client(),
+    with {:ok, client} <- Claude.client(client_opts(chat)),
          {:ok, model} <- Models.fetch(chat.model) do
-      Messages.stream_to(client, params(chat, model))
+      Messages.stream_to(client, params(chat, model), session: to_string(chat.id))
     end
   end
+
+  # The beta header is only needed once a chat has an MCP server enabled, so
+  # a chat with none never sends it.
+  defp client_opts(%Chat{mcp_servers: []}), do: []
+  defp client_opts(%Chat{mcp_servers: [_ | _]}), do: [beta: MCP.beta()]
+
+  @doc """
+  Whether the API paused this turn part-way through its own tool loop.
+
+  A server-side tool that runs long — web search, say — comes back with
+  nothing for anyone to decide. The stored turn goes back unchanged and Claude
+  carries on, so the app continues on its own rather than leaving a
+  half-finished reply on screen.
+  """
+  @spec paused?(Message.t()) :: boolean()
+  def paused?(%Message{stop_reason: reason}), do: Claudex.Message.stop(reason) == :paused
+
+  @doc """
+  Whether the reply was cut off rather than finished.
+
+  Either ceiling counts: the one this request asked for, and the model's own
+  context window.
+  """
+  @spec truncated?(Message.t()) :: boolean()
+  def truncated?(%Message{stop_reason: reason}), do: Claudex.Message.stop(reason) == :truncated
 
   @doc "Cancels a stream that's still running."
   @spec cancel(Handle.t()) :: :ok
@@ -53,49 +81,17 @@ defmodule ClaudexChat.Completions do
   @doc """
   Folds one stream event into the reply.
 
-  Events the app has no use for — tool calls, unknown block types — leave the
-  reply untouched.
+  Everything the API sends goes through the SDK's accumulator, which joins
+  fragmented tool arguments and merges the usage that arrives in two pieces.
   """
   @spec apply_event(Reply.t(), Event.t()) :: Reply.t()
   def apply_event(%Reply{} = reply, event) do
-    reply
-    |> Map.put(:acc, Accumulator.add(reply.acc, event))
-    |> fold(event)
+    %{reply | acc: Accumulator.add(reply.acc, event)}
   end
-
-  defp fold(%Reply{} = reply, %Event.MessageStart{message: message}) do
-    %{reply | model: message.model || reply.model, usage: message.usage}
-  end
-
-  defp fold(%Reply{} = reply, %Event.ContentBlockDelta{delta: {:text, chunk}}) do
-    %{reply | text: reply.text <> chunk}
-  end
-
-  defp fold(%Reply{} = reply, %Event.ContentBlockDelta{delta: {:thinking, chunk}}) do
-    %{reply | thinking: reply.thinking <> chunk}
-  end
-
-  defp fold(%Reply{} = reply, %Event.ContentBlockDelta{delta: {:signature, signature}}) do
-    %{reply | thinking_signature: signature}
-  end
-
-  defp fold(%Reply{} = reply, %Event.MessageDelta{} = event) do
-    %{
-      reply
-      | stop_reason: event.stop_reason || reply.stop_reason,
-        usage: Reply.merge_usage(reply.usage, event.usage)
-    }
-  end
-
-  defp fold(%Reply{} = reply, _event), do: reply
 
   @doc "Records why a stream ended without finishing."
   @spec fail(Reply.t(), term()) :: Reply.t()
   def fail(%Reply{} = reply, reason), do: %{reply | error: describe(reason)}
-
-  @doc "Marks a reply the user stopped."
-  @spec cancelled(Reply.t()) :: Reply.t()
-  def cancelled(%Reply{} = reply), do: %{reply | stop_reason: "cancelled"}
 
   @doc """
   Persists the finished reply as an assistant message.

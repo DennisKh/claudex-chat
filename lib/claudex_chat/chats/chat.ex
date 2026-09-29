@@ -9,6 +9,7 @@ defmodule ClaudexChat.Chats.Chat do
   import Ecto.Changeset
 
   alias ClaudexChat.Chats.Message
+  alias ClaudexChat.MCP
 
   @thinking_modes ~w(off adaptive enabled)
   @min_thinking_budget 1024
@@ -19,6 +20,7 @@ defmodule ClaudexChat.Chats.Chat do
           model: String.t(),
           thinking_mode: String.t(),
           thinking_budget: pos_integer() | nil,
+          mcp_servers: [String.t()],
           messages: [Message.t()] | Ecto.Association.NotLoaded.t()
         }
 
@@ -27,6 +29,7 @@ defmodule ClaudexChat.Chats.Chat do
     field :model, :string
     field :thinking_mode, :string, default: "off"
     field :thinking_budget, :integer
+    field :mcp_servers, {:array, :string}, default: []
 
     has_many :messages, Message, preload_order: [asc: :id]
 
@@ -46,11 +49,23 @@ defmodule ClaudexChat.Chats.Chat do
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(chat, attrs) do
     chat
-    |> cast(attrs, [:title, :model, :thinking_mode, :thinking_budget])
+    |> cast(attrs, [:title, :model, :thinking_mode, :thinking_budget, :mcp_servers])
     |> validate_required([:title, :model, :thinking_mode])
     |> validate_length(:title, min: 1, max: 255)
     |> validate_inclusion(:thinking_mode, @thinking_modes)
     |> validate_thinking_budget()
+    |> validate_mcp_servers()
+  end
+
+  defp validate_mcp_servers(changeset) do
+    known = Enum.map(MCP.servers(), & &1.name)
+
+    validate_change(changeset, :mcp_servers, fn :mcp_servers, names ->
+      case names -- known do
+        [] -> []
+        unknown -> [mcp_servers: "unknown server(s): #{Enum.join(unknown, ", ")}"]
+      end
+    end)
   end
 
   defp validate_thinking_budget(changeset) do

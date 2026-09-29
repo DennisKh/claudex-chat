@@ -2,9 +2,6 @@ defmodule ClaudexChat.Models.Capabilities do
   @moduledoc """
   Reads the `capabilities` map the Models API returns into the handful of
   facts the composer needs.
-
-  The map is deep and grows over time, so every lookup treats a missing branch
-  as unsupported rather than assuming a shape.
   """
 
   alias Claudex.Model
@@ -20,30 +17,19 @@ defmodule ClaudexChat.Models.Capabilities do
   """
   @spec to_entry(Model.t()) :: Entry.t()
   def to_entry(%Model{} = model) do
-    capabilities = model.capabilities || %{}
-
     %Entry{
       id: model.id,
       display_name: model.display_name || model.id,
       max_output_tokens: model.max_tokens || @default_max_output_tokens,
-      thinking_modes: thinking_modes(capabilities),
-      accepts_images: supported?(capabilities, ["image_input"]),
-      accepts_pdf: supported?(capabilities, ["pdf_input"]),
-      accepts_code_execution: supported?(capabilities, ["code_execution"])
+      thinking_modes: thinking_modes(model),
+      accepts_images: Model.supports?(model, "image_input"),
+      accepts_pdf: Model.supports?(model, "pdf_input"),
+      accepts_code_execution: Model.supports?(model, "code_execution")
     }
   end
 
-  defp thinking_modes(capabilities) do
+  defp thinking_modes(%Model{} = model) do
     ["off"] ++
-      Enum.filter(~w(adaptive enabled), fn type ->
-        supported?(capabilities, ["thinking", "types", type])
-      end)
-  end
-
-  defp supported?(capabilities, path) do
-    case get_in(capabilities, path) do
-      %{"supported" => supported} -> supported == true
-      _missing -> false
-    end
+      Enum.filter(~w(adaptive enabled), &Model.supports?(model, ["thinking", "types", &1]))
   end
 end

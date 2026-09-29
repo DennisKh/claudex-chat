@@ -37,6 +37,44 @@ case System.get_env("ANTHROPIC_API_KEY") do
   _no_key -> :ok
 end
 
+# Claudex's OpenTelemetry spans, exported to Langfuse. Nothing is recorded
+# unless both keys are present, so the app boots without them.
+#
+# This file is the last one config loads, in every environment, so what it
+# sets here beats config/test.exs — a shell with both Langfuse variables
+# exported would otherwise have `mix test` sending spans to a real project.
+# Keeping the test environment out has to happen here; nothing in
+# config/test.exs can hold it.
+#
+# `mix claudex.gen.tracing langfuse` guards on :prod. This one is a local demo
+# run with `mix phx.server`, so dev is where the traces are worth having.
+if config_env() != :test do
+  case {System.get_env("LANGFUSE_PUBLIC_KEY"), System.get_env("LANGFUSE_SECRET_KEY")} do
+    {public_key, secret_key}
+    when is_binary(public_key) and public_key != "" and is_binary(secret_key) and
+           secret_key != "" ->
+      config :opentelemetry_exporter,
+        otlp_protocol: :http_protobuf,
+        otlp_endpoint:
+          System.get_env("LANGFUSE_HOST", "https://cloud.langfuse.com") <> "/api/public/otel",
+        otlp_headers: [
+          {"authorization", "Basic " <> Base.encode64(public_key <> ":" <> secret_key)},
+          {"x-langfuse-ingestion-version", "4"}
+        ]
+
+      config :claudex, tracing: true
+
+      # A span goes wherever the exporter sends it, so prompts and replies are
+      # a deliberate choice rather than a default.
+      config :claudex, trace_content: System.get_env("LANGFUSE_TRACE_CONTENT") == "true"
+
+      config :opentelemetry, resource: %{service: %{name: "claudex_chat"}}
+
+    _no_keys ->
+      :ok
+  end
+end
+
 # Where the file tools resolve relative paths. In a container this is the
 # mounted workspace; on a dev machine config/dev.exs already set it.
 if root = System.get_env("CLAUDEX_CHAT_ROOT") do

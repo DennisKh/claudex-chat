@@ -8,8 +8,12 @@ defmodule ClaudexChat.Chats.Message do
   number. An assistant message may have blank content — a stream that was
   cancelled or failed before any text arrived still gets recorded.
 
-  `thinking_signature` is kept because a later turn on the same model has to
-  send the thinking block back exactly as it arrived, signature included.
+  `content_blocks` is the assistant turn exactly as the API sent it, and is
+  what goes back in the next request: a thinking signature and a search
+  result's encrypted content are both rejected if they change on the way
+  through, and neither can be rebuilt from the columns beside it.
+  `thinking_signature` is what a message stored before those blocks were kept
+  falls back on.
   """
 
   use Ecto.Schema
@@ -26,6 +30,7 @@ defmodule ClaudexChat.Chats.Message do
           content: String.t(),
           thinking: String.t() | nil,
           thinking_signature: String.t() | nil,
+          content_blocks: [map()],
           attachments: [Attachment.t()],
           tool_calls: [ToolCall.t()],
           model: String.t() | nil,
@@ -44,6 +49,7 @@ defmodule ClaudexChat.Chats.Message do
     field :content, :string, default: ""
     field :thinking, :string
     field :thinking_signature, :string
+    field :content_blocks, {:array, :map}, default: []
     field :model, :string
     field :input_tokens, :integer
     field :output_tokens, :integer
@@ -65,6 +71,19 @@ defmodule ClaudexChat.Chats.Message do
   @spec roles() :: [String.t()]
   def roles, do: @roles
 
+  @doc """
+  Whether the tool calls in this message may be run.
+
+  A turn that was refused or cut off can carry a call Claude never finished
+  asking for — the arguments stop mid-JSON — and the API rejects a result for
+  a call it never confirmed. Those calls are left alone and the turn is retried
+  instead.
+  """
+  @spec tool_calls_runnable?(t()) :: boolean()
+  def tool_calls_runnable?(%__MODULE__{stop_reason: reason}) do
+    Claudex.Message.stop(reason) not in [:refusal, :truncated]
+  end
+
   @doc "Validates a message and its attachments."
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(message, attrs) do
@@ -74,6 +93,7 @@ defmodule ClaudexChat.Chats.Message do
       :content,
       :thinking,
       :thinking_signature,
+      :content_blocks,
       :model,
       :input_tokens,
       :output_tokens,

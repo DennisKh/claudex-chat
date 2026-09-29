@@ -5,10 +5,13 @@ defmodule ClaudexChatWeb.ChatLive.Components do
 
   use ClaudexChatWeb, :html
 
+  alias Claudex.ContentBlock
+
   alias ClaudexChat.Chats.Message
+  alias ClaudexChat.Completions
   alias ClaudexChat.Completions.Reply
   alias ClaudexChat.Models.Model
-  alias ClaudexChat.{Paths, Tools}
+  alias ClaudexChat.{MCP, Paths, Tools}
   alias ClaudexChatWeb.Markdown
 
   @thinking_labels %{"off" => "No thinking", "adaptive" => "Adaptive", "enabled" => "Extended"}
@@ -124,6 +127,8 @@ defmodule ClaudexChatWeb.ChatLive.Components do
         {Markdown.to_html(@message.content)}
       </div>
 
+      <.mcp_calls message={@message} />
+
       <.tool_calls message={@message} />
 
       <.usage message={@message} />
@@ -156,11 +161,17 @@ defmodule ClaudexChatWeb.ChatLive.Components do
       <span :if={@message.model}>{@message.model}</span>
       <span :if={@message.input_tokens}>{@message.input_tokens} in</span>
       <span :if={@message.output_tokens}>{@message.output_tokens} out</span>
+      <span :if={@message.cache_creation_tokens && @message.cache_creation_tokens > 0}>
+        {@message.cache_creation_tokens} cache write
+      </span>
       <span :if={@message.cache_read_tokens && @message.cache_read_tokens > 0}>
-        {@message.cache_read_tokens} cached
+        {@message.cache_read_tokens} cache read
       </span>
       <span :if={@message.duration_ms}>{format_duration(@message.duration_ms)}</span>
       <span :if={@message.stop_reason == "cancelled"} class="text-warning">stopped</span>
+      <span :if={Completions.truncated?(@message)} class="text-warning">
+        truncated — hit the token ceiling
+      </span>
     </div>
     """
   end
@@ -173,23 +184,23 @@ defmodule ClaudexChatWeb.ChatLive.Components do
   Renders as plain text rather than Markdown: the document is still being
   written, so half of it doesn't parse yet, and re-rendering on every delta
   would mean a Markdown pass per token.
+
+  Something is always moving until the first token of the answer lands. A turn
+  that thinks and then goes quiet — running a search, deciding on a tool — is
+  still working, and a panel of finished reasoning on its own reads as a reply
+  that stopped.
   """
   def streaming_reply(assigns) do
+    assigns = assign(assigns, Reply.preview(assigns.reply))
+
     ~H"""
     <div class="space-y-2">
-      <.thinking_panel
-        :if={@reply.thinking != ""}
-        thinking={@reply.thinking}
-        open={@reply.text == ""}
-      />
+      <.thinking_panel :if={@thinking != ""} thinking={@thinking} open={@text == ""} />
 
-      <div :if={@reply.text != ""} class="whitespace-pre-wrap text-sm leading-relaxed" phx-no-format>{@reply.text}<span class="ml-0.5 inline-block h-4 w-[2px] animate-pulse bg-base-content/60 align-text-bottom" /></div>
+      <div :if={@text != ""} class="whitespace-pre-wrap text-sm leading-relaxed" phx-no-format>{@text}<span class="ml-0.5 inline-block h-4 w-[2px] animate-pulse bg-base-content/60 align-text-bottom" /></div>
 
-      <div
-        :if={@reply.text == "" and @reply.thinking == ""}
-        class="flex items-center gap-2 text-sm text-base-content/50"
-      >
-        <.icon name="hero-arrow-path" class="size-4 animate-spin" /> Waiting for the first token
+      <div :if={@text == ""} class="flex items-center gap-2 text-sm text-base-content/50">
+        <.icon name="hero-arrow-path" class="size-4 animate-spin" /> {waiting_label(@thinking)}
       </div>
     </div>
     """
@@ -216,10 +227,51 @@ defmodule ClaudexChatWeb.ChatLive.Components do
   attr :message, Message, required: true
 
   @doc """
+  Calls Claude made to a tool on an MCP server, paired with their results and
+  collapsed by default.
+
+  These ran on Anthropic's own infrastructure during the reply, the same way
+  a web search does — there was no approval step, unlike `tool_calls/1`.
+  """
+  def mcp_calls(assigns) do
+    assigns = assign(assigns, :calls, mcp_call_pairs(assigns.message))
+
+    ~H"""
+    <div :if={@calls != []} class="space-y-2">
+      <details
+        :for={{use, result} <- @calls}
+        class="rounded-lg border border-base-300 bg-base-200/40"
+      >
+        <summary class="flex cursor-pointer select-none items-center gap-2 px-3 py-1.5 font-mono text-[11px] text-base-content/50 hover:text-base-content/80">
+          <.icon name="hero-puzzle-piece-micro" class="size-3.5" />
+          <span>{use["server_name"]} · {use["name"]}</span>
+          <span :if={result && result["is_error"]} class="text-error">failed</span>
+        </summary>
+        <div class="space-y-2 border-t border-base-300 px-3 py-2">
+          <pre
+            class="overflow-x-auto font-mono text-[11px] leading-relaxed text-base-content/60"
+            phx-no-curly-interpolation
+          ><%= JSON.encode!(use["input"] || %{}) %></pre>
+          <pre
+            :if={result}
+            class="max-h-64 overflow-auto font-mono text-[11px] leading-relaxed text-base-content/60"
+            phx-no-curly-interpolation
+          ><%= mcp_result_text(result) %></pre>
+        </div>
+      </details>
+    </div>
+    """
+  end
+
+  attr :message, Message, required: true
+
+  @doc """
   The approval gate: what Claude wants to run, and the two buttons that decide
   it. Calls already decided show what happened instead.
   """
   def tool_calls(assigns) do
+    assigns = assign(assigns, :runnable, Message.tool_calls_runnable?(assigns.message))
+
     ~H"""
     <div :if={@message.tool_calls != []} class="space-y-2">
       <div
@@ -260,7 +312,14 @@ defmodule ClaudexChatWeb.ChatLive.Components do
         ><%= tool_input(call) %></pre>
 
         <div
-          :if={call.status == "pending"}
+          :if={call.status == "pending" and not @runnable}
+          class="border-t border-base-300 px-3 py-2 text-xs text-base-content/50"
+        >
+          Not run — Claude never confirmed this call.
+        </div>
+
+        <div
+          :if={call.status == "pending" and @runnable}
           class="flex items-center gap-2 border-t border-warning/30 px-3 py-2"
         >
           <button
@@ -309,6 +368,8 @@ defmodule ClaudexChatWeb.ChatLive.Components do
   attr :streaming, :boolean, required: true
   attr :disabled, :boolean, default: false
   attr :content, :string, default: ""
+  attr :mcp_servers, :list, default: []
+  attr :mcp_menu_open, :boolean, default: false
 
   @doc "The prompt box and the controls under it."
   def composer(assigns) do
@@ -372,6 +433,29 @@ defmodule ClaudexChatWeb.ChatLive.Components do
                 <.live_file_input upload={@uploads.attachments} class="sr-only" />
               </label>
 
+              <div class="relative">
+                <button
+                  type="button"
+                  id="mcp-toggle"
+                  phx-click="toggle_mcp_menu"
+                  disabled={@streaming}
+                  title="MCP servers"
+                  aria-label="MCP servers"
+                  class={[
+                    "flex h-8 items-center gap-1 rounded-lg px-2 hover:bg-base-200 disabled:opacity-50",
+                    @mcp_servers == [] && "text-base-content/50 hover:text-base-content",
+                    @mcp_servers != [] && "text-base-content"
+                  ]}
+                >
+                  <.icon name="hero-puzzle-piece" class="size-4" />
+                  <span :if={@mcp_servers != []} class="font-mono text-[11px]">
+                    {length(@mcp_servers)}
+                  </span>
+                </button>
+
+                <.mcp_menu :if={@mcp_menu_open} chat_mcp_servers={@mcp_servers} />
+              </div>
+
               <div class="flex-1"></div>
 
               <button
@@ -415,6 +499,51 @@ defmodule ClaudexChatWeb.ChatLive.Components do
     """
   end
 
+  attr :chat_mcp_servers, :list, required: true
+
+  # The composer's MCP panel: every server in the catalogue, with a toggle
+  # for whether this chat has it enabled.
+  defp mcp_menu(assigns) do
+    assigns = assign(assigns, :servers, MCP.servers())
+
+    ~H"""
+    <div
+      id="mcp-menu"
+      phx-click-away="toggle_mcp_menu"
+      class="absolute bottom-full left-0 z-10 mb-2 w-72 rounded-lg border border-base-300 bg-base-100 p-2 shadow-lg"
+    >
+      <p class="px-1 pb-2 text-[11px] leading-relaxed text-base-content/50">
+        These run on Anthropic's servers during the reply, like web search — there's no approval step.
+      </p>
+
+      <button
+        :for={server <- @servers}
+        type="button"
+        id={"mcp-server-#{server.name}"}
+        phx-click="toggle_mcp"
+        phx-value-name={server.name}
+        class="flex w-full items-start gap-2 rounded-lg px-2 py-1.5 text-left hover:bg-base-200"
+      >
+        <span class={[
+          "mt-0.5 flex size-4 shrink-0 items-center justify-center rounded border",
+          server.name in @chat_mcp_servers && "border-base-content bg-base-content",
+          server.name not in @chat_mcp_servers && "border-base-300"
+        ]}>
+          <.icon
+            :if={server.name in @chat_mcp_servers}
+            name="hero-check-micro"
+            class="size-3 text-base-100"
+          />
+        </span>
+        <span class="min-w-0">
+          <span class="block font-mono text-xs font-medium">{server.label}</span>
+          <span class="block text-[11px] text-base-content/50">{server.description}</span>
+        </span>
+      </button>
+    </div>
+    """
+  end
+
   attr :uploads, :map, required: true
 
   defp upload_previews(assigns) do
@@ -445,8 +574,15 @@ defmodule ClaudexChatWeb.ChatLive.Components do
 
   defp thinking_label(mode), do: Map.fetch!(@thinking_labels, mode)
 
+  defp waiting_label(""), do: "Waiting for the first token"
+  defp waiting_label(_thinking), do: "Working on it"
+
+  # Asking again can clear a cancelled or failed reply, and can clear this
+  # request's own token ceiling. It can't clear the model's context window:
+  # the history that overflowed it is the history the retry would resend.
   defp retryable?(%Message{stop_reason: "cancelled"}), do: true
   defp retryable?(%Message{error: error}) when not is_nil(error), do: true
+  defp retryable?(%Message{stop_reason: "max_tokens"}), do: true
   defp retryable?(%Message{}), do: false
 
   defp tool_icon("read_file"), do: "hero-document-text-micro"
@@ -471,6 +607,22 @@ defmodule ClaudexChatWeb.ChatLive.Components do
   end
 
   defp tool_input(%{input: input}), do: JSON.encode!(input)
+
+  # `content_blocks` is stored as the API's own JSON, string keys included, so
+  # it's read directly here rather than decoded into SDK structs first.
+  defp mcp_call_pairs(%Message{content_blocks: blocks}) do
+    results = Enum.filter(blocks, &(&1["type"] == "mcp_tool_result"))
+
+    blocks
+    |> Enum.filter(&(&1["type"] == "mcp_tool_use"))
+    |> Enum.map(fn use -> {use, Enum.find(results, &(&1["tool_use_id"] == use["id"]))} end)
+  end
+
+  # A stored block is the API's own JSON, so it goes back through the SDK to be
+  # read: the shape of an MCP result is the SDK's to know, not this module's.
+  defp mcp_result_text(result) do
+    result |> ContentBlock.decode() |> ContentBlock.MCPToolResult.text()
+  end
 
   defp status_class("approved"), do: "text-success"
   defp status_class("denied"), do: "text-warning"

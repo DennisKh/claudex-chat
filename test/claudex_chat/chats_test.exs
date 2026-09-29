@@ -37,6 +37,19 @@ defmodule ClaudexChat.ChatsTest do
       assert {:error, changeset} = Chats.create_chat(%{model: @model, thinking_mode: "maybe"})
       assert %{thinking_mode: ["is invalid"]} = errors_on(changeset)
     end
+
+    test "rejects an mcp server that isn't in the catalogue" do
+      assert {:error, changeset} =
+               Chats.create_chat(%{model: @model, mcp_servers: ["not-a-real-server"]})
+
+      assert %{mcp_servers: [message]} = errors_on(changeset)
+      assert message =~ "not-a-real-server"
+    end
+
+    test "accepts a known mcp server" do
+      assert chat = chat(%{mcp_servers: ["deepwiki"]})
+      assert chat.mcp_servers == ["deepwiki"]
+    end
   end
 
   describe "thinking settings" do

@@ -11,11 +11,11 @@ defmodule ClaudexChat.Claude do
 
   @doc "Builds a client from application config."
   @spec client() :: {:ok, Client.t()} | {:error, :missing_api_key}
-  def client do
-    {:ok, Claudex.new()}
-  rescue
-    ArgumentError -> {:error, :missing_api_key}
-  end
+  def client, do: client([])
+
+  @doc "Builds a client from application config, with extra `Claudex.Client` options."
+  @spec client([Client.option()]) :: {:ok, Client.t()} | {:error, :missing_api_key}
+  def client(opts), do: Client.build(opts)
 
   @doc "Whether an API key is configured at all."
   @spec configured?() :: boolean()

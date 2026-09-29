@@ -91,6 +91,19 @@ back to a built-in list instead of asking the Models API.
   approval step: it executes inside the API turn, where this app has no
   opportunity to pause it. Which variant is offered depends on the model's
   reported `code_execution` capability.
+- **MCP servers** are enabled per chat from the puzzle-piece button next to
+  the attach clip. Like web search, they run on Anthropic's servers during
+  the reply, so there is no approval step. DeepWiki (`mcp.deepwiki.com`,
+  public repositories, no auth) is the only one in the catalogue so far; the
+  calls it makes show up in the transcript, collapsed by default.
+- **The conversation is cached between turns.** Each request asks the API to
+  cache the longest prefix it can, so a follow-up re-reads the history rather
+  than paying for it again. It matters most when a turn is expensive: an MCP
+  answer that pulled a whole wiki into the reply is around 120k tokens, and
+  every later turn in that chat would otherwise re-send all of it. The usage
+  line under a reply reports both halves — `cache write` for what was stored,
+  `cache read` for what came back — and a short chat shows neither, because a
+  prefix below the model's minimum silently isn't cached.
 - **A stopped or failed reply can be retried.** Press Stop mid-stream, or hit
   an API error, and the reply gets a Retry button: it discards that reply —
   and anything after it — and asks again. There is no "resume": continuing a
@@ -114,6 +127,34 @@ real recorded API payloads, copied from the SDK's own test suite.
 
 See `CLAUDE.md` for the project's engineering rules and `AGENTS.md` for the
 Phoenix and LiveView house style.
+
+### Tracing
+
+Claudex emits OpenTelemetry spans for every request, tool call and exchange;
+this app exports them to [Langfuse](https://langfuse.com) when both keys are
+present, and does nothing at all otherwise:
+
+- `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` — required. Without both, no
+  exporter is configured and no spans are recorded, so the app boots and runs
+  exactly as it does today.
+- `LANGFUSE_HOST` — defaults to `https://cloud.langfuse.com`.
+- `LANGFUSE_TRACE_CONTENT` — set to `true` to put prompts, replies and tool
+  arguments on the spans. Off by default: a span goes wherever the exporter
+  sends it, so capturing content is a deliberate choice.
+
+`../claudex/docker-compose.langfuse.yml` runs a local Langfuse stack — web,
+worker, Postgres, ClickHouse, Redis and MinIO — if you'd rather see the
+traces without sending them anywhere:
+
+```sh
+cd ../claudex
+cp .env.langfuse.example .env.langfuse
+docker compose -f docker-compose.langfuse.yml --env-file .env.langfuse up -d
+```
+
+Open http://localhost:3000, create an organisation and a project, and take
+the public and secret keys it gives you for the env vars above (with
+`LANGFUSE_HOST=http://localhost:3000`).
 
 ## License
 
