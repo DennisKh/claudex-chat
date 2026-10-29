@@ -14,9 +14,21 @@ defmodule ClaudexChat.Tools do
 
   use Claudex.Tool
 
-  alias ClaudexChat.Paths
+  alias Claudex.ContentBlock.{Document, Image}
+
+  alias ClaudexChat.{Attachments, Paths}
+  alias ClaudexChat.Tools.Edit
 
   @max_read_bytes 200_000
+  @max_upload_bytes 5_000_000
+  @uploaded_types %{
+    ".png" => "image/png",
+    ".jpg" => "image/jpeg",
+    ".jpeg" => "image/jpeg",
+    ".gif" => "image/gif",
+    ".webp" => "image/webp",
+    ".pdf" => "application/pdf"
+  }
   @max_entries 500
 
   # Which argument carries the path, per tool. One home for it, because the UI
@@ -26,6 +38,7 @@ defmodule ClaudexChat.Tools do
     "read_file" => "path",
     "write_file" => "path",
     "edit_file" => "path",
+    "apply_edits" => "path",
     "list_files" => "path"
   }
 
@@ -55,6 +68,7 @@ defmodule ClaudexChat.Tools do
   and credential stores are refused whatever the user approves.
   """
   @tool %{
+    strict: true,
     args: [
       path:
         "Directory to list. Absolute, or relative to the project directory (\".\" for the project itself)."
@@ -99,41 +113,60 @@ defmodule ClaudexChat.Tools do
   end
 
   @doc """
-  Read a text file on the user's machine and return its full contents.
+  Read a file on the user's machine: a text file's full contents, or an image
+  or PDF to look at.
 
   Use this whenever an answer depends on what a file actually contains, and
   always before editing one — never describe a file you have not read. The
   file is already on this machine, so read it rather than asking the user to
-  paste or upload it.
+  paste or upload it. That goes for screenshots, diagrams and PDFs too: a
+  `.png`, `.jpg`, `.gif`, `.webp` or `.pdf` comes back as the image or the
+  document itself.
 
-  Relative paths resolve against the project directory. This reads UTF-8 text;
-  it does not decode images, PDFs or other binaries, and a file above 200,000
-  bytes is refused rather than truncated, so what you get back is always the
-  whole file.
+  Relative paths resolve against the project directory. Any other file is
+  read as UTF-8 text. A text file above 200,000 bytes, or an image or PDF
+  above 5,000,000, is refused rather than truncated, so what you get back is
+  always the whole file.
   """
   @tool %{
+    strict: true,
     args: [
       path:
         "File to read. Absolute, or relative to the project directory (\"mix.exs\", \"lib/app.ex\")."
     ]
   }
-  @spec read_file(String.t()) :: String.t()
+  @spec read_file(String.t()) :: String.t() | Image.t() | Document.t()
   def read_file(path) do
     file = resolve!(path)
+    media_type = @uploaded_types[file |> Path.extname() |> String.downcase()]
+    limit = if media_type, do: @max_upload_bytes, else: @max_read_bytes
 
     case File.stat(file) do
       {:ok, %File.Stat{type: :directory}} ->
         raise Claudex.Tool.Error, "#{path} is a directory, not a file"
 
-      {:ok, %File.Stat{size: size}} when size > @max_read_bytes ->
-        raise Claudex.Tool.Error,
-              "#{path} is #{size} bytes, over the #{@max_read_bytes} byte limit"
+      {:ok, %File.Stat{size: size}} when size > limit ->
+        raise Claudex.Tool.Error, "#{path} is #{size} bytes, over the #{limit} byte limit"
+
+      {:ok, _stat} when is_nil(media_type) ->
+        read!(file, path)
 
       {:ok, _stat} ->
-        read!(file, path)
+        upload!(file, path, media_type)
 
       {:error, reason} ->
         raise Claudex.Tool.Error, "can't read #{path}: #{:file.format_error(reason)}"
+    end
+  end
+
+  # An image or PDF goes to the Files API and back to Claude as a block that
+  # names it, so the history every later request resends carries an id rather
+  # than the bytes.
+  defp upload!(file, path, media_type) do
+    case Attachments.upload(file, Path.basename(file), media_type) do
+      {:ok, %{file_id: id}} when media_type == "application/pdf" -> Document.file(id, title: path)
+      {:ok, %{file_id: id}} -> Image.file(id)
+      {:error, reason} -> raise Claudex.Tool.Error, "can't hand #{path} over: #{inspect(reason)}"
     end
   end
 
@@ -150,6 +183,7 @@ defmodule ClaudexChat.Tools do
   a patch, or a diff.
   """
   @tool %{
+    strict: true,
     args: [
       path:
         "File to write. Absolute, or relative to the project directory. Parent directories are created.",
@@ -184,6 +218,7 @@ defmodule ClaudexChat.Tools do
   use `write_file`.
   """
   @tool %{
+    strict: true,
     args: [
       path: "File to edit. Absolute, or relative to the project directory.",
       old_string:
@@ -197,17 +232,71 @@ defmodule ClaudexChat.Tools do
     file = resolve!(path)
     content = read!(file, path)
 
-    case occurrences(content, old_string) do
-      0 -> raise Claudex.Tool.Error, "old_string does not appear in #{path}"
-      1 -> replace!(file, path, content, old_string, new_string)
-      n -> raise Claudex.Tool.Error, "old_string appears #{n} times in #{path}; make it unique"
-    end
-  end
-
-  defp replace!(file, path, content, old_string, new_string) do
-    File.write!(file, String.replace(content, old_string, new_string))
+    File.write!(file, replace_once!(content, old_string, new_string, path, ""))
 
     "replaced 1 occurrence in #{path}"
+  end
+
+  @doc """
+  Make several exact-text replacements in one file on the user's machine, all
+  or none.
+
+  Use this instead of repeated `edit_file` calls when one change touches
+  several places in the same file. The user approves the whole set at once,
+  and the file is written only if every edit applies.
+
+  Edits apply in order, each to the text the previous ones left, and each
+  `old_string` must appear exactly once at that point. When any edit is
+  missing or ambiguous the file is left untouched and the refusal names the
+  edit, so fix that one and send the whole set again rather than only the
+  edits after it. Read the file first so every `old_string` matches byte for
+  byte. To create a file, use `write_file`.
+  """
+  @tool %{
+    strict: true,
+    args: [
+      path: "File to edit. Absolute, or relative to the project directory.",
+      edits:
+        "The replacements, applied in order. Each `old_string` is literal text matching the file " <>
+          "byte for byte and appearing exactly once; each `new_string` is the literal text to put in its place."
+    ]
+  }
+  @spec apply_edits(String.t(), nonempty_list(Edit.t())) :: String.t()
+  def apply_edits(path, edits) do
+    file = resolve!(path)
+    content = read!(file, path)
+
+    updated =
+      edits
+      |> Enum.with_index(1)
+      |> Enum.reduce(content, fn {edit, number}, text -> apply_edit!(text, edit, number, path) end)
+
+    File.write!(file, updated)
+
+    "applied #{length(edits)} edits to #{path}"
+  end
+
+  defp apply_edit!(text, %{"old_string" => old, "new_string" => new}, number, path)
+       when is_binary(old) and is_binary(new) do
+    replace_once!(text, old, new, path, "edit #{number}: ")
+  end
+
+  defp apply_edit!(_text, _edit, number, _path) do
+    raise Claudex.Tool.Error, "edit #{number} needs both old_string and new_string as text"
+  end
+
+  defp replace_once!(content, old_string, new_string, path, label) do
+    case occurrences(content, old_string) do
+      0 ->
+        raise Claudex.Tool.Error, "#{label}old_string does not appear in #{path}"
+
+      1 ->
+        String.replace(content, old_string, new_string)
+
+      n ->
+        raise Claudex.Tool.Error,
+              "#{label}old_string appears #{n} times in #{path}; make it unique"
+    end
   end
 
   defp occurrences(content, string) do

@@ -135,4 +135,67 @@ defmodule ClaudexChat.ToolsTest do
       assert File.read!(Path.join(root, "a.txt")) == "x = 1\ny = 1\n"
     end
   end
+
+  describe "apply_edits/2" do
+    defp edit(old_string, new_string),
+      do: %{"old_string" => old_string, "new_string" => new_string}
+
+    test "applies every edit in order, each to the text the last one left", %{root: root} do
+      file = Path.join(root, "a.ex")
+      File.write!(file, "alpha beta gamma")
+
+      assert Tools.apply_edits("a.ex", [edit("alpha", "one"), edit("one beta", "two")]) ==
+               "applied 2 edits to a.ex"
+
+      assert File.read!(file) == "two gamma"
+    end
+
+    test "leaves the file untouched when any edit fails, and names it", %{root: root} do
+      file = Path.join(root, "a.ex")
+      File.write!(file, "alpha beta")
+
+      assert_raise Claudex.Tool.Error, ~r/^edit 2: old_string does not appear/, fn ->
+        Tools.apply_edits("a.ex", [edit("alpha", "one"), edit("missing", "x")])
+      end
+
+      assert File.read!(file) == "alpha beta"
+    end
+
+    test "refuses an edit without both strings", %{root: root} do
+      File.write!(Path.join(root, "a.ex"), "alpha")
+
+      assert_raise Claudex.Tool.Error, ~r/edit 1 needs both old_string and new_string/, fn ->
+        Tools.apply_edits("a.ex", [%{"old_string" => "alpha"}])
+      end
+    end
+
+    test "refuses a denied system path" do
+      assert_raise Claudex.Tool.Error, ~r/never readable or writable/, fn ->
+        Tools.apply_edits("/etc/hosts", [edit("a", "b")])
+      end
+    end
+
+    test "is offered with each edit described as an object, and shows its path for approval" do
+      tool = Enum.find(Claudex.Tool.list(Tools), &(&1.name == "apply_edits"))
+
+      assert %{
+               "type" => "array",
+               "minItems" => 1,
+               "items" => %{
+                 "type" => "object",
+                 "required" => ["old_string", "new_string"],
+                 "properties" => %{
+                   "old_string" => %{"type" => "string"},
+                   "new_string" => %{"type" => "string"}
+                 }
+               }
+             } =
+               tool.input_schema
+               |> JSON.encode!()
+               |> JSON.decode!()
+               |> get_in(["properties", "edits"])
+
+      assert Tools.path_of("apply_edits", %{"path" => "a.ex", "edits" => []}) == "a.ex"
+    end
+  end
 end
