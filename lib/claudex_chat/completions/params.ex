@@ -44,7 +44,7 @@ defmodule ClaudexChat.Completions.Params do
     %{
       model: chat.model,
       max_tokens: min(@max_tokens, model.max_output_tokens),
-      messages: Enum.flat_map(history, &to_param(&1, chat.model)),
+      messages: Enum.flat_map(history, &to_param/1),
       tools: tools(model, Map.get(mcp, :tools, [])),
       system: system(),
       cache_control: %{type: "ephemeral"}
@@ -140,91 +140,67 @@ defmodule ClaudexChat.Completions.Params do
 
   defp put_thinking(params, _chat, _model), do: params
 
-  defp to_param(%Message{role: "user"} = message, _model) do
+  defp to_param(%Message{role: "user"} = message) do
     [Claudex.Message.user(attachment_blocks(message) ++ text_blocks(message.content))]
   end
 
-  defp to_param(%Message{role: "assistant"} = message, model) do
-    case assistant_content(message, model) do
-      [] -> []
-      content -> [Claudex.Message.assistant(content)] ++ tool_result_param(message)
+  defp to_param(%Message{role: "assistant"} = message) do
+    case assistant_turn(message) do
+      %{content: []} -> []
+      turn -> [turn | tool_result_param(message)]
     end
   end
 
-  # A stored turn goes back as the API sent it, block for block: a web search
-  # the API ran for itself is only resumable with its own blocks in place, and
-  # they can't be rebuilt from the columns beside them. A message stored before
-  # those blocks were kept is reassembled from what there is.
-  defp assistant_content(%Message{content_blocks: []} = message, model) do
-    thinking_block(message, model) ++ text_blocks(message.content) ++ tool_use_blocks(message)
+  # A stored turn goes back through the SDK as the message it was, with its
+  # stop reason, so the SDK's replay rules apply: an unsigned thinking block,
+  # an empty text block, and a call a cut-off reply never finished asking for
+  # are left out. A thinking block from another model is sent too; the API
+  # drops it itself.
+  defp assistant_turn(%Message{} = message) do
+    Claudex.Message.to_param(%Claudex.Message{
+      role: "assistant",
+      content: assistant_blocks(message),
+      stop_reason: message.stop_reason
+    })
   end
 
-  defp assistant_content(%Message{content_blocks: blocks} = message, model) do
-    Enum.filter(blocks, &replayable?(&1, message, model))
+  # A message stored before its blocks were kept is rebuilt from the columns
+  # beside them.
+  defp assistant_blocks(%Message{content_blocks: []} = message) do
+    thinking =
+      if message.thinking,
+        do: [
+          %ContentBlock.Thinking{
+            thinking: message.thinking,
+            signature: message.thinking_signature
+          }
+        ],
+        else: []
+
+    tool_uses =
+      for call <- message.tool_calls,
+          do: %ContentBlock.ToolUse{id: call.call_id, name: call.name, input: call.input}
+
+    thinking ++ [%ContentBlock.Text{text: message.content}] ++ tool_uses
   end
 
-  # Thinking is dropped when it came from another model, which the API rejects,
-  # or when the stream stopped before the signature that closes it arrived.
-  defp replayable?(%{"type" => "thinking"} = block, %Message{model: model}, current_model) do
-    model == current_model and block["signature"] not in [nil, ""]
-  end
+  defp assistant_blocks(%Message{content_blocks: blocks}),
+    do: Enum.map(blocks, &ContentBlock.decode/1)
 
-  defp replayable?(%{"type" => "redacted_thinking"}, %Message{model: model}, current_model) do
-    model == current_model
-  end
-
-  defp replayable?(%{"type" => "text"} = block, _message, _model),
-    do: block["text"] not in [nil, ""]
-
-  defp replayable?(%{"type" => "tool_use"}, %Message{} = message, _model),
-    do: Message.tool_calls_runnable?(message)
-
-  defp replayable?(_block, _message, _model), do: true
-
-  defp tool_use_blocks(%Message{} = message) do
-    if Message.tool_calls_runnable?(message) do
-      for call <- message.tool_calls do
-        block(%ContentBlock.ToolUse{id: call.call_id, name: call.name, input: call.input})
-      end
-    else
-      []
-    end
-  end
-
-  # Results go back under role "user" — they're input to Claude, not output
-  # from it. A call still waiting on a human has no result to send, so the
-  # whole block is held back until every call in the turn is resolved.
+  # Results go back under role "user", all of them in one message, and only
+  # once every call has one: the API answers a whole reply's calls together.
   defp tool_result_param(%Message{tool_calls: []}), do: []
 
   defp tool_result_param(%Message{tool_calls: tool_calls}) do
-    if Enum.any?(tool_calls, &ToolCall.pending?/1) do
-      []
+    if Enum.all?(tool_calls, &ToolCall.answered?/1) do
+      [Claudex.Message.tool_results(Enum.map(tool_calls, & &1.result))]
     else
-      [Claudex.Message.tool_results(Enum.map(tool_calls, &tool_result_block/1))]
+      []
     end
-  end
-
-  defp tool_result_block(%ToolCall{} = call) do
-    Claudex.Tool.result(call.call_id, call.output || "", is_error: ToolCall.error?(call))
   end
 
   defp text_blocks(""), do: []
   defp text_blocks(text), do: [block(%ContentBlock.Text{text: text})]
-
-  defp thinking_block(%Message{thinking: nil}, _model), do: []
-  defp thinking_block(%Message{thinking_signature: nil}, _model), do: []
-
-  defp thinking_block(%Message{model: model} = message, current_model)
-       when model == current_model do
-    [
-      block(%ContentBlock.Thinking{
-        thinking: message.thinking,
-        signature: message.thinking_signature
-      })
-    ]
-  end
-
-  defp thinking_block(_message, _model), do: []
 
   defp attachment_blocks(%Message{attachments: attachments}) do
     Enum.map(attachments, &block(attachment_block(&1)))

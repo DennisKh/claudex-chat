@@ -12,8 +12,8 @@ defmodule ClaudexChat.Chats.Message do
   what goes back in the next request: a thinking signature and a search
   result's encrypted content are both rejected if they change on the way
   through, and neither can be rebuilt from the columns beside it.
-  `thinking_signature` is what a message stored before those blocks were kept
-  falls back on.
+  `thinking` and `content` are also what a message stored before those blocks
+  were kept is rebuilt from, along with `thinking_signature`.
   """
 
   use Ecto.Schema
@@ -70,19 +70,6 @@ defmodule ClaudexChat.Chats.Message do
   @doc "The roles a message may have."
   @spec roles() :: [String.t()]
   def roles, do: @roles
-
-  @doc """
-  Whether the tool calls in this message may be run.
-
-  A turn that was refused or cut off can carry a call Claude never finished
-  asking for — the arguments stop mid-JSON — and the API rejects a result for
-  a call it never confirmed. Those calls are left alone and the turn is retried
-  instead.
-  """
-  @spec tool_calls_runnable?(t()) :: boolean()
-  def tool_calls_runnable?(%__MODULE__{stop_reason: reason}) do
-    Claudex.Message.stop(reason) not in [:refusal, :truncated]
-  end
 
   @doc "Validates a message and its attachments."
   @spec changeset(t(), map()) :: Ecto.Changeset.t()

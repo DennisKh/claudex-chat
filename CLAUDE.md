@@ -7,7 +7,7 @@ The point of this app is to *show what the SDK can do* — streaming into a Live
 ## What this app is
 
 - One page: chat history in a left sidebar, messages in the middle, a prompt composer at the bottom with model / thinking / attachment controls under the input.
-- Replies stream in token by token via `Claudex.Messages.stream_to/3`; when a reply finishes, the message shows its token usage and elapsed time.
+- Replies stream in token by token via `Claudex.ToolRunner.stream_to/3`, which runs the whole tool conversation; when a reply finishes, the message shows its token usage and elapsed time.
 - PostgreSQL persists chats, messages and attachments across restarts.
 
 ## What this app is not
@@ -83,14 +83,14 @@ The demo is small; that's not a licence to put everything in the LiveView.
 - Business logic, Ecto queries, SDK calls and usage accounting live in context modules under `lib/claudex_chat/`. A context may lean on private helper modules; the context is the public surface.
 - `lib/claudex_chat_web/live/` holds assigns, event handling, `handle_info/2` for stream messages, and rendering. A LiveView calls contexts; it does not build Ecto queries or Claudex params inline.
 - Message lists render through LiveView streams, not a growing assign — a long chat must not re-send the whole history on every delta.
-- The streaming reply is the one exception to "state lives in the database": the in-flight text buffer lives in assigns until the stream reports `:done`, then the finished message is persisted in one write with its token usage and duration.
+- The streaming reply is the one exception to "state lives in the database": the in-flight reply lives in assigns until its turn arrives, then the finished message is persisted in one write with its token usage and duration. A reply cut off before its turn is persisted from what had arrived.
 - Match `stream_to/3` messages on the handle's `ref`. A stale stream from a chat the user has navigated away from must not be able to write into the current one.
 
 ## Rule 4a — Tools never run unasked
 
 The file tools are the one part of this demo that can change something outside the database, so two guards stand in front of them and neither may be removed for convenience.
 
-- A tool call is persisted `"pending"` and runs only when `ClaudexChat.Approvals.approve/2` is called from a human action. `Claudex.ToolRunner` executes tools automatically and is therefore the wrong tool for this app — the loop is driven by hand.
+- The loop runs in `Claudex.ToolRunner`, and `ClaudexChat.Approvals.gate/1` is its `:before_call`. A call nobody has decided on halts the run with `{:halt, :awaiting_approval}` and is persisted `"pending"`. `approve/2` and `deny/2` only record a human's decision; the last one resumes the run with `tool_results: []`, and the runner runs the approved calls then. Nothing may answer the gate with `:ok` except a decision a human made on that call.
 - There is no sandbox. Any path the OS user can reach is reachable — another project, `~/Downloads` — and nothing is pre-authorised: the human approving that specific call is what allows it.
 - `ClaudexChat.Paths` enforces the one thing approval cannot lift: a deny list of system directories and credential stores. It resolves symlinks *and* the denied prefixes before comparing, because `/etc` is itself a symlink to `/private/etc` on macOS and an unresolved prefix would never match. Don't move the check into the caller.
 - The approval prompt must always show the action and the full path, and flag a path outside the project. A human approving a call they can't fully see is not consent.

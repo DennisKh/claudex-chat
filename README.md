@@ -65,8 +65,11 @@ back to a built-in list instead of asking the Models API.
 
 - **Chats** are listed most-recently-active first and named after their first
   message. They live in PostgreSQL, so they survive a restart.
-- **Replies stream in** through `Claudex.Messages.stream_to/3`, which runs the
-  request in its own process and posts events to the LiveView.
+- **Replies stream in** through `Claudex.ToolRunner.stream_to/3`, which runs
+  the whole tool conversation in its own process and posts its events in 50 ms
+  batches, and each finished turn, to the LiveView. A stopped reply arrives as
+  a turn of its own and is kept. It resumes a turn the API paused, and stops
+  after ten requests in a row.
 - **Thinking** is offered per model, in the form that model accepts: `adaptive`
   on current models, a token budget on Haiku 4.5 and older. The reasoning is
   shown in a collapsible panel, and the block is replayed on later turns so the
@@ -74,10 +77,17 @@ back to a built-in list instead of asking the Models API.
 - **Attachments** go to the Claude Files API; a message stores the `file_id`,
   not the bytes.
 - **Tools run on this machine, with your approval.** Claude can ask to list a
-  directory or read, write and edit a file. Each request appears in the
-  conversation showing the action and the full path, and does nothing until
-  you press Approve or Deny. Denying tells Claude it was refused, and it
-  carries on from there.
+  directory, read a file, write one, or make one or several edits to one. Each
+  request appears in the conversation showing the action and the full path.
+  The runner halts on it, and nothing runs until you press Approve or Deny on
+  every call in that reply; then the conversation resumes and the runner runs
+  what you approved. The halt is stored, so a reload or a restart in between
+  loses nothing. Denying tells Claude it was refused, and it carries on from
+  there.
+- **Claude can look at images and PDFs on disk.** Reading a `.png`, `.jpg`,
+  `.gif`, `.webp` or `.pdf` uploads it to the Files API and hands Claude the
+  image or document itself, by `file_id`, so later turns don't resend the
+  bytes.
 - **Nothing is pre-authorised, and nothing is sandboxed.** Another project or
   `~/Downloads` is reachable — your approval on that specific call is what
   allows it. A path outside the project directory is flagged as such on the

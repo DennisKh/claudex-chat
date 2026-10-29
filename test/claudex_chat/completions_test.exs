@@ -9,6 +9,7 @@ defmodule ClaudexChat.CompletionsTest do
   alias ClaudexChat.Completions
   alias ClaudexChat.Completions.{Params, Reply}
   alias ClaudexChat.Models.Model
+  alias Claudex.ToolRunner.Turn
 
   @opus %Model{
     id: "claude-opus-5",
@@ -78,6 +79,26 @@ defmodule ClaudexChat.CompletionsTest do
 
   defp assistant(content, attrs) do
     struct!(ClaudexChat.Chats.Message, Map.merge(%{role: "assistant", content: content}, attrs))
+  end
+
+  # What a request carries once encoded, so a block the SDK rebuilt with atom
+  # keys compares equal to the stored one it came from.
+  defp wire(term), do: term |> Jason.encode!() |> Jason.decode!()
+
+  defp turn(reply, opts) do
+    message = Reply.message(reply)
+
+    %Turn{
+      message: message,
+      index: 1,
+      tool_uses: Claudex.Message.tool_uses(message),
+      tool_results: Keyword.get(opts, :results, []),
+      stop: Keyword.get(opts, :stop)
+    }
+  end
+
+  defp record(chat, reply, opts \\ []) do
+    Completions.record_turn(chat, reply, nil, turn(reply, opts))
   end
 
   describe "params — thinking config" do
@@ -158,7 +179,7 @@ defmodule ClaudexChat.CompletionsTest do
              ] = content
     end
 
-    test "replays a thinking block when the model is unchanged" do
+    test "replays a thinking block stored in its columns, with its signature" do
       message =
         assistant("Done", %{
           thinking: "reasoning",
@@ -172,7 +193,7 @@ defmodule ClaudexChat.CompletionsTest do
       assert %{type: "thinking", thinking: "reasoning", signature: "sig-abc"} = hd(content)
     end
 
-    test "drops a thinking block produced by a different model" do
+    test "sends a thinking block from another model as it was, for the API to drop" do
       message =
         assistant("Done", %{
           thinking: "reasoning",
@@ -182,7 +203,7 @@ defmodule ClaudexChat.CompletionsTest do
 
       params = Params.build(chat(), [message], @opus)
 
-      assert [%{content: [%{type: "text"}]}] = params.messages
+      assert [%{content: [%{type: "thinking"}, %{type: "text"}]}] = params.messages
     end
 
     test "drops a thinking block with no signature to send back" do
@@ -274,13 +295,23 @@ defmodule ClaudexChat.CompletionsTest do
   end
 
   describe "params — tool calls in history" do
-    defp tool_call(status, output) do
+    defp tool_call(status, output, id \\ "toolu_1") do
+      result =
+        if output,
+          do: %{
+            "type" => "tool_result",
+            "tool_use_id" => id,
+            "content" => output,
+            "is_error" => status in ~w(denied failed)
+          }
+
       %ClaudexChat.Chats.ToolCall{
-        call_id: "toolu_1",
+        call_id: id,
         name: "read_file",
         input: %{"path" => "a.txt"},
         status: status,
-        output: output
+        output: output,
+        result: result
       }
     end
 
@@ -289,6 +320,7 @@ defmodule ClaudexChat.CompletionsTest do
         user("Read a.txt"),
         assistant("Reading it", %{
           model: "claude-opus-5",
+          stop_reason: "tool_use",
           tool_calls: [tool_call("approved", "file contents")]
         })
       ]
@@ -302,14 +334,14 @@ defmodule ClaudexChat.CompletionsTest do
 
       assert results.role == "user"
 
-      assert [
+      assert wire(results.content) == [
                %{
-                 type: "tool_result",
-                 tool_use_id: "toolu_1",
-                 content: "file contents",
-                 is_error: false
+                 "type" => "tool_result",
+                 "tool_use_id" => "toolu_1",
+                 "content" => "file contents",
+                 "is_error" => false
                }
-             ] = results.content
+             ]
     end
 
     test "marks a denied call as an error so Claude knows it refused" do
@@ -317,6 +349,7 @@ defmodule ClaudexChat.CompletionsTest do
         user("Read a.txt"),
         assistant("Reading it", %{
           model: "claude-opus-5",
+          stop_reason: "tool_use",
           tool_calls: [tool_call("denied", "The user denied this tool call.")]
         })
       ]
@@ -324,13 +357,17 @@ defmodule ClaudexChat.CompletionsTest do
       params = Params.build(chat(), history, @opus)
 
       assert [_user, _assistant, results] = params.messages
-      assert [%{is_error: true}] = results.content
+      assert [%{"is_error" => true}] = wire(results.content)
     end
 
     test "withholds results while a call is still waiting on a human" do
       history = [
         user("Read a.txt"),
-        assistant("Reading it", %{model: "claude-opus-5", tool_calls: [tool_call("pending", nil)]})
+        assistant("Reading it", %{
+          model: "claude-opus-5",
+          stop_reason: "tool_use",
+          tool_calls: [tool_call("pending", nil)]
+        })
       ]
 
       params = Params.build(chat(), history, @opus)
@@ -360,7 +397,22 @@ defmodule ClaudexChat.CompletionsTest do
       params = Params.build(chat(), history, @opus)
 
       assert [_user, assistant] = params.messages
-      assert assistant.content == [%{"type" => "text", "text" => "Reading it"}]
+      assert wire(assistant.content) == [%{"type" => "text", "text" => "Reading it"}]
+    end
+
+    test "ends on the reply until every call has a result, which is where a resume picks up" do
+      history = [
+        user("Read a.txt"),
+        assistant("Reading it", %{
+          model: "claude-opus-5",
+          stop_reason: "tool_use",
+          tool_calls: [tool_call("approved", nil), tool_call("denied", "no", "toolu_2")]
+        })
+      ]
+
+      params = Params.build(chat(), history, @opus)
+
+      assert [_user, %{role: "assistant"}] = params.messages
     end
 
     test "withholds results when the turn was stored as content blocks" do
@@ -375,6 +427,7 @@ defmodule ClaudexChat.CompletionsTest do
         user("Read a.txt"),
         assistant("Reading it", %{
           model: "claude-opus-5",
+          stop_reason: "tool_use",
           content_blocks: [%{"type" => "text", "text" => "Reading it"}, tool_use],
           tool_calls: [tool_call("pending", nil)]
         })
@@ -383,7 +436,7 @@ defmodule ClaudexChat.CompletionsTest do
       params = Params.build(chat(), history, @opus)
 
       assert [_user, assistant] = params.messages
-      assert tool_use in assistant.content
+      assert tool_use in wire(assistant.content)
     end
   end
 
@@ -403,26 +456,26 @@ defmodule ClaudexChat.CompletionsTest do
 
       assert [%{role: "assistant", content: content}] = params.messages
 
-      assert content == [
+      assert wire(content) == [
                @web_search_use,
                @web_search_result,
                %{"type" => "text", "text" => "Here"}
              ]
     end
 
-    test "drops a stored thinking block produced by a different model" do
+    test "keeps a stored thinking block from another model, for the API to drop" do
+      thinking = %{"type" => "thinking", "thinking" => "reasoning", "signature" => "sig"}
+
       message =
         assistant("Here", %{
           model: "claude-haiku-4-5",
-          content_blocks: [
-            %{"type" => "thinking", "thinking" => "reasoning", "signature" => "sig"},
-            %{"type" => "text", "text" => "Here"}
-          ]
+          content_blocks: [thinking, %{"type" => "text", "text" => "Here"}]
         })
 
       params = Params.build(chat(), [message], @opus)
 
-      assert [%{content: [%{"type" => "text"}]}] = params.messages
+      assert [%{content: [first, _text]}] = params.messages
+      assert wire(first) == thinking
     end
 
     test "drops a stored thinking block the stream never signed" do
@@ -437,23 +490,26 @@ defmodule ClaudexChat.CompletionsTest do
 
       params = Params.build(chat(), [message], @opus)
 
-      assert [%{content: [%{"type" => "text"}]}] = params.messages
+      assert [%{content: content}] = params.messages
+      assert wire(content) == [%{"type" => "text", "text" => "Here"}]
     end
 
     test "drops a text block with nothing in it" do
       message =
         assistant("", %{
           model: "claude-opus-5",
+          stop_reason: "pause_turn",
           content_blocks: [%{"type" => "text", "text" => ""}, @web_search_use]
         })
 
       params = Params.build(chat(), [message], @opus)
 
-      assert [%{content: [@web_search_use]}] = params.messages
+      assert [%{content: content}] = params.messages
+      assert wire(content) == [@web_search_use]
     end
   end
 
-  describe "apply_event/2" do
+  describe "Reply.add/2" do
     defp start_event do
       %Event.MessageStart{
         message: %Claudex.Message{
@@ -471,7 +527,7 @@ defmodule ClaudexChat.CompletionsTest do
     defp delta(index, delta), do: %Event.ContentBlockDelta{index: index, delta: delta}
 
     defp fold(events) do
-      Enum.reduce(events, Reply.new("claude-opus-5"), &Completions.apply_event(&2, &1))
+      Enum.reduce(events, Reply.new("claude-opus-5"), &Reply.add(&2, &1))
     end
 
     test "accumulates text and thinking separately" do
@@ -499,7 +555,9 @@ defmodule ClaudexChat.CompletionsTest do
           delta(0, {:signature, "sig"})
         ])
 
-      assert Reply.thinking_signature(reply) == "sig"
+      %{content_blocks: [block]} = Reply.to_message_attrs(reply, Reply.message(reply))
+
+      assert block["signature"] == "sig"
     end
 
     test "ignores events the chat has no use for" do
@@ -507,23 +565,6 @@ defmodule ClaudexChat.CompletionsTest do
 
       assert Reply.text(reply) == ""
       assert Reply.thinking(reply) == ""
-      assert Reply.tool_calls(reply) == []
-    end
-
-    test "collects the tools Claude asked for" do
-      reply =
-        fold([
-          start_event(),
-          block_start(0, %ContentBlock.ToolUse{id: "toolu_1", name: "read_file", input: %{}}),
-          delta(0, {:input_json, ~s({"path":)}),
-          delta(0, {:input_json, ~s( "mix.exs"})}),
-          %Event.ContentBlockStop{index: 0}
-        ])
-
-      assert [%{call_id: "toolu_1", name: "read_file", input: input, status: "pending"}] =
-               Reply.tool_calls(reply)
-
-      assert input == %{"path" => "mix.exs"}
     end
 
     test "merges the final usage over the initial one" do
@@ -535,7 +576,7 @@ defmodule ClaudexChat.CompletionsTest do
           %Event.MessageDelta{stop_reason: "end_turn", usage: %Usage{output_tokens: 118}}
         ])
 
-      attrs = Reply.to_message_attrs(reply)
+      attrs = Reply.to_message_attrs(reply, Reply.message(reply))
 
       assert attrs.input_tokens == 42
       assert attrs.output_tokens == 118
@@ -544,7 +585,7 @@ defmodule ClaudexChat.CompletionsTest do
     end
   end
 
-  describe "apply_event/2 against a recorded stream" do
+  describe "Reply.add/2 against a recorded stream" do
     @fixture Path.expand("../fixtures/thinking_stream.sse", __DIR__)
 
     defp recorded_events do
@@ -564,17 +605,24 @@ defmodule ClaudexChat.CompletionsTest do
         Enum.reduce(
           recorded_events(),
           Reply.new("claude-haiku-4-5"),
-          &Completions.apply_event(&2, &1)
+          &Reply.add(&2, &1)
         )
 
+      attrs = Reply.to_message_attrs(reply, Reply.message(reply))
+
       assert Reply.thinking(reply) =~ "On"
-      assert Reply.thinking_signature(reply) != nil
+
+      assert Enum.any?(
+               attrs.content_blocks,
+               &(&1["type"] == "thinking" and &1["signature"] != "")
+             )
+
       assert Reply.text(reply) =~ "multi-tap"
-      assert Reply.to_message_attrs(reply).stop_reason == "end_turn"
+      assert attrs.stop_reason == "end_turn"
 
       # output_tokens is only correct in message_delta; service_tier only ever
       # arrives in message_start. Both surviving proves the two were merged.
-      assert Reply.to_message_attrs(reply).output_tokens == 600
+      assert attrs.output_tokens == 600
       assert Accumulator.message(reply.acc).usage.service_tier == "standard"
     end
   end
@@ -595,25 +643,24 @@ defmodule ClaudexChat.CompletionsTest do
       refute Reply.empty?(fold(search_events("pause_turn")))
     end
 
-    test "is stored rather than dropped, so the pause can be resumed" do
+    test "is stored, so the history the runner resumed from is the one kept" do
       chat = chat()
 
-      assert {:ok, %{message: message}} =
-               Completions.finish(chat, fold(search_events("pause_turn")))
+      assert {:ok, %{message: message}} = record(chat, fold(search_events("pause_turn")))
 
-      assert Completions.paused?(message)
+      assert message.stop_reason == "pause_turn"
       assert message.content == ""
     end
 
     test "goes back into the next request with its encrypted results intact" do
       chat = chat()
 
-      {:ok, %{chat: chat}} = Completions.finish(chat, fold(search_events("pause_turn")))
+      {:ok, %{chat: chat}} = record(chat, fold(search_events("pause_turn")))
 
       params = Params.build(chat, Chats.list_messages(chat), @opus)
 
       assert [%{role: "assistant", content: content}] = params.messages
-      assert content == [@web_search_use, @web_search_result]
+      assert wire(content) == [@web_search_use, @web_search_result]
     end
 
     test "keeps every thinking block, not just the first" do
@@ -633,7 +680,7 @@ defmodule ClaudexChat.CompletionsTest do
       assert Reply.thinking(reply) == "first\n\nsecond"
 
       signatures =
-        Reply.to_message_attrs(reply).content_blocks
+        Reply.to_message_attrs(reply, Reply.message(reply)).content_blocks
         |> Enum.filter(&(&1["type"] == "thinking"))
         |> Enum.map(& &1["signature"])
 
@@ -660,8 +707,7 @@ defmodule ClaudexChat.CompletionsTest do
     test "never becomes a call anyone is asked to approve" do
       chat = chat()
 
-      assert {:ok, %{message: message}} =
-               Completions.finish(chat, fold(mcp_events("pause_turn")))
+      assert {:ok, %{message: message}} = record(chat, fold(mcp_events("pause_turn")))
 
       assert message.tool_calls == []
       refute Approvals.awaiting?(message)
@@ -670,12 +716,12 @@ defmodule ClaudexChat.CompletionsTest do
     test "is stored and replays into the next request with its content and is_error intact" do
       chat = chat()
 
-      {:ok, %{chat: chat}} = Completions.finish(chat, fold(mcp_events("pause_turn")))
+      {:ok, %{chat: chat}} = record(chat, fold(mcp_events("pause_turn")))
 
       params = Params.build(chat, Chats.list_messages(chat), @opus)
 
       assert [%{role: "assistant", content: content}] = params.messages
-      assert content == [@mcp_use, @mcp_result]
+      assert wire(content) == [@mcp_use, @mcp_result]
     end
   end
 
@@ -704,13 +750,13 @@ defmodule ClaudexChat.CompletionsTest do
           %Event.MessageDelta{stop_reason: "end_turn", usage: %Usage{output_tokens: 30}}
         ])
 
-      {:ok, %{chat: chat}} = Completions.finish(chat, reply)
+      {:ok, %{chat: chat}} = record(chat, reply)
 
       params = Params.build(chat, Chats.list_messages(chat), @opus)
 
       assert [%{role: "assistant", content: content}] = params.messages
 
-      assert Enum.map(content, & &1["type"]) == [
+      assert Enum.map(wire(content), & &1["type"]) == [
                "thinking",
                "text",
                "server_tool_use",
@@ -732,28 +778,15 @@ defmodule ClaudexChat.CompletionsTest do
           delta(0, {:text, "Half a th"})
         ]
         |> fold()
-        |> Reply.cancelled()
 
-      assert {:ok, %{message: message}} = Completions.finish(chat, reply)
+      assert {:ok, %{message: message}} = record(chat, reply, stop: :cancelled)
 
       assert message.content == "Half a th"
       assert message.stop_reason == "cancelled"
     end
-
-    test "is dropped when nothing had arrived, rather than stored as a blank turn" do
-      reply = [start_event()] |> fold() |> Reply.cancelled()
-
-      assert Completions.finish(chat(), reply) == :ignore
-    end
   end
 
-  describe "paused?/1 and truncated?/1" do
-    test "pause_turn is a pause, and nothing else is" do
-      assert Completions.paused?(%ClaudexChat.Chats.Message{stop_reason: "pause_turn"})
-      refute Completions.paused?(%ClaudexChat.Chats.Message{stop_reason: "end_turn"})
-      refute Completions.paused?(%ClaudexChat.Chats.Message{stop_reason: nil})
-    end
-
+  describe "truncated?/1" do
     test "a reply that ran out of room is truncated, whichever ceiling it hit" do
       for reason <- ~w(max_tokens model_context_window_exceeded) do
         assert Completions.truncated?(%ClaudexChat.Chats.Message{stop_reason: reason}),
@@ -765,8 +798,8 @@ defmodule ClaudexChat.CompletionsTest do
     end
   end
 
-  describe "finish/2" do
-    test "stores the reply with its usage and duration" do
+  describe "record_turn/4 and record_failure/2" do
+    test "stores a finished turn with its usage and duration" do
       chat = chat()
 
       reply =
@@ -780,7 +813,7 @@ defmodule ClaudexChat.CompletionsTest do
           }
         ])
 
-      assert {:ok, %{message: message}} = Completions.finish(chat, reply)
+      assert {:ok, %{message: message}} = record(chat, reply)
       assert message.content == "Hi"
       assert message.input_tokens == 10
       assert message.output_tokens == 20
@@ -792,15 +825,193 @@ defmodule ClaudexChat.CompletionsTest do
       reply =
         "claude-opus-5"
         |> Reply.new()
-        |> Completions.fail(%Claudex.Error{type: :overloaded, message: "overloaded"})
+        |> Reply.failed(
+          Completions.describe(%Claudex.Error{type: :overloaded, message: "overloaded"})
+        )
 
-      assert {:ok, %{message: message}} = Completions.finish(chat(), reply)
+      assert {:ok, %{message: message}} = Completions.record_failure(chat(), reply)
       assert message.error =~ "overloaded"
       assert message.content == ""
     end
 
     test "drops a reply that arrived with nothing and no error" do
-      assert :ignore = Completions.finish(chat(), Reply.new("claude-opus-5"))
+      assert :ignore = Completions.record_failure(chat(), Reply.new("claude-opus-5"))
+    end
+
+    test "stores the calls of a reply that halted for approval as pending" do
+      chat = chat()
+
+      reply =
+        fold([
+          start_event(),
+          block_start(0, %ContentBlock.ToolUse{id: "toolu_1", name: "read_file", input: %{}}),
+          delta(0, {:input_json, ~s({"path":)}),
+          delta(0, {:input_json, ~s( "mix.exs"})}),
+          %Event.ContentBlockStop{index: 0},
+          %Event.MessageDelta{stop_reason: "tool_use", usage: %Usage{output_tokens: 9}}
+        ])
+
+      assert {:ok, %{message: message}} = record(chat, reply, stop: Approvals.halt())
+
+      assert [%{call_id: "toolu_1", name: "read_file", status: "pending", result: nil} = call] =
+               message.tool_calls
+
+      assert call.input == %{"path" => "mix.exs"}
+      assert Approvals.awaiting?(message)
+    end
+
+    test "stores a call the runner already answered, and never offers it" do
+      chat = chat()
+
+      reply =
+        fold([
+          start_event(),
+          block_start(0, %ContentBlock.ToolUse{id: "toolu_1", name: "read_file", input: %{}}),
+          %Event.ContentBlockStop{index: 0},
+          %Event.MessageDelta{stop_reason: "tool_use", usage: %Usage{output_tokens: 9}}
+        ])
+
+      invalid = %{
+        type: "tool_result",
+        tool_use_id: "toolu_1",
+        content: ~s({"INVALID_JSON":"{\\"path\\":"}),
+        is_error: true
+      }
+
+      assert {:ok, %{message: message}} = record(chat, reply, results: [invalid])
+
+      assert [%{status: "failed", result: %{"is_error" => true}}] = message.tool_calls
+      refute Approvals.awaiting?(message)
+    end
+
+    test "a reply cut off inside a call keeps none of it" do
+      chat = chat()
+
+      reply =
+        [
+          start_event(),
+          block_start(0, %ContentBlock.Text{text: ""}),
+          delta(0, {:text, "Let me look"}),
+          block_start(1, %ContentBlock.ToolUse{id: "toolu_1", name: "write_file", input: %{}}),
+          delta(1, {:input_json, ~s({"path":)})
+        ]
+        |> fold()
+
+      assert {:ok, %{message: message}} = record(chat, reply, stop: :cancelled)
+
+      assert message.tool_calls == []
+      assert Enum.map(message.content_blocks, & &1["type"]) == ["text"]
+    end
+  end
+
+  describe "Reply.add_events/2" do
+    test "folds a batch in the order it arrived" do
+      reply =
+        Reply.add_events(Reply.new("claude-opus-5"), [
+          start_event(),
+          block_start(0, %ContentBlock.Text{text: ""}),
+          delta(0, {:text, "Hel"}),
+          delta(0, {:text, "lo"})
+        ])
+
+      assert Reply.text(reply) == "Hello"
+    end
+  end
+
+  describe "a resumed turn a cancel ended" do
+    test "still records the results of the tools that ran" do
+      chat = chat()
+
+      {:ok, %{message: awaiting}} =
+        Chats.add_assistant_message(chat, %{
+          content: "Reading it",
+          stop_reason: "tool_use",
+          tool_calls: [
+            %{call_id: "toolu_1", name: "read_file", input: %{"path" => "a"}, status: "approved"}
+          ]
+        })
+
+      resumed = %Turn{
+        index: 1,
+        stop: :cancelled,
+        message: %Claudex.Message{role: "assistant", content: []},
+        tool_results: [
+          %{type: "tool_result", tool_use_id: "toolu_1", content: "contents", is_error: false}
+        ]
+      }
+
+      assert {:ok, %{message: message}} =
+               Completions.record_turn(chat, Reply.new(chat.model), awaiting, resumed)
+
+      assert message.id == awaiting.id
+      assert [%{status: "approved", output: "contents"}] = message.tool_calls
+    end
+  end
+
+  describe "uncached?/1" do
+    test "is true when both cache counters came back zero" do
+      assert Completions.uncached?(%ClaudexChat.Chats.Message{
+               cache_creation_tokens: 0,
+               cache_read_tokens: 0
+             })
+    end
+
+    test "is false when the cache was written or read" do
+      refute Completions.uncached?(%ClaudexChat.Chats.Message{
+               cache_creation_tokens: 5_650,
+               cache_read_tokens: 0
+             })
+
+      refute Completions.uncached?(%ClaudexChat.Chats.Message{
+               cache_creation_tokens: 0,
+               cache_read_tokens: 5_650
+             })
+    end
+
+    test "is false when either counter was never reported" do
+      refute Completions.uncached?(%ClaudexChat.Chats.Message{
+               cache_creation_tokens: nil,
+               cache_read_tokens: 0
+             })
+
+      refute Completions.uncached?(%ClaudexChat.Chats.Message{})
+    end
+  end
+
+  describe "storing a stream cut off part-way" do
+    test "leaves the unsigned thinking block out of the stored turn" do
+      reply =
+        [
+          start_event(),
+          block_start(0, %ContentBlock.Thinking{thinking: "", signature: ""}),
+          delta(0, {:thinking, "reasoning"}),
+          block_start(1, %ContentBlock.Text{text: ""}),
+          delta(1, {:text, "Half"})
+        ]
+        |> fold()
+
+      assert {:ok, %{message: message}} = record(chat(), reply, stop: :cancelled)
+
+      assert Enum.map(message.content_blocks, & &1["type"]) == ["text"]
+      assert message.thinking == "reasoning"
+    end
+
+    test "replays nothing for a turn that only thought before it stopped" do
+      chat = chat()
+
+      reply =
+        [
+          start_event(),
+          block_start(0, %ContentBlock.Thinking{thinking: "", signature: ""}),
+          delta(0, {:thinking, "reasoning"})
+        ]
+        |> fold()
+
+      assert {:ok, %{message: message}} = record(chat, reply, stop: :cancelled)
+
+      params = Params.build(chat, [user("Hello"), message], @opus)
+
+      assert [%{role: "user"}] = params.messages
     end
   end
 end

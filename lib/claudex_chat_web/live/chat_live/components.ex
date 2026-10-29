@@ -7,7 +7,8 @@ defmodule ClaudexChatWeb.ChatLive.Components do
 
   alias Claudex.ContentBlock
 
-  alias ClaudexChat.Chats.Message
+  alias ClaudexChat.Approvals
+  alias ClaudexChat.Chats.{Message, ToolCall}
   alias ClaudexChat.Completions
   alias ClaudexChat.Completions.Reply
   alias ClaudexChat.Models.Model
@@ -153,7 +154,8 @@ defmodule ClaudexChatWeb.ChatLive.Components do
   @doc """
   What the reply cost and how long it took.
 
-  Counters the API didn't report are left out rather than shown as zero.
+  Counters the API didn't report are left out rather than shown as zero. A
+  reply whose cache counters were both reported as zero says so.
   """
   def usage(assigns) do
     ~H"""
@@ -166,6 +168,12 @@ defmodule ClaudexChatWeb.ChatLive.Components do
       </span>
       <span :if={@message.cache_read_tokens && @message.cache_read_tokens > 0}>
         {@message.cache_read_tokens} cache read
+      </span>
+      <span
+        :if={Completions.uncached?(@message)}
+        title="Caching was requested, and this request neither wrote nor read the cache"
+      >
+        uncached
       </span>
       <span :if={@message.duration_ms}>{format_duration(@message.duration_ms)}</span>
       <span :if={@message.stop_reason == "cancelled"} class="text-warning">stopped</span>
@@ -270,7 +278,8 @@ defmodule ClaudexChatWeb.ChatLive.Components do
   it. Calls already decided show what happened instead.
   """
   def tool_calls(assigns) do
-    assigns = assign(assigns, :runnable, Message.tool_calls_runnable?(assigns.message))
+    assigns =
+      assign(assigns, :pending, MapSet.new(Approvals.pending(assigns.message), & &1.call_id))
 
     ~H"""
     <div :if={@message.tool_calls != []} class="space-y-2">
@@ -312,14 +321,14 @@ defmodule ClaudexChatWeb.ChatLive.Components do
         ><%= tool_input(call) %></pre>
 
         <div
-          :if={call.status == "pending" and not @runnable}
+          :if={call.status == "approved" and not ToolCall.answered?(call)}
           class="border-t border-base-300 px-3 py-2 text-xs text-base-content/50"
         >
-          Not run — Claude never confirmed this call.
+          Runs once every call in this reply is decided.
         </div>
 
         <div
-          :if={call.status == "pending" and @runnable}
+          :if={MapSet.member?(@pending, call.call_id)}
           class="flex items-center gap-2 border-t border-warning/30 px-3 py-2"
         >
           <button
@@ -403,7 +412,7 @@ defmodule ClaudexChatWeb.ChatLive.Components do
               >
                 <optgroup :for={{family, models} <- @model_groups} label={family}>
                   <option :for={model <- models} value={model.id} selected={model.id == @model.id}>
-                    {model.display_name}
+                    {model_label(model)}
                   </option>
                 </optgroup>
               </select>
@@ -574,6 +583,13 @@ defmodule ClaudexChatWeb.ChatLive.Components do
 
   defp thinking_label(mode), do: Map.fetch!(@thinking_labels, mode)
 
+  defp model_label(model) do
+    case Model.lifecycle_note(model) do
+      nil -> model.display_name
+      note -> "#{model.display_name} (#{note})"
+    end
+  end
+
   defp waiting_label(""), do: "Waiting for the first token"
   defp waiting_label(_thinking), do: "Working on it"
 
@@ -588,12 +604,14 @@ defmodule ClaudexChatWeb.ChatLive.Components do
   defp tool_icon("read_file"), do: "hero-document-text-micro"
   defp tool_icon("write_file"), do: "hero-pencil-square-micro"
   defp tool_icon("edit_file"), do: "hero-pencil-micro"
+  defp tool_icon("apply_edits"), do: "hero-pencil-micro"
   defp tool_icon("list_files"), do: "hero-folder-open-micro"
   defp tool_icon(_name), do: "hero-wrench-screwdriver-micro"
 
   defp tool_verb("read_file"), do: "Read file"
   defp tool_verb("write_file"), do: "Write file"
   defp tool_verb("edit_file"), do: "Edit file"
+  defp tool_verb("apply_edits"), do: "Apply edits"
   defp tool_verb("list_files"), do: "List directory"
   defp tool_verb(name), do: name
 

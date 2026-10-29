@@ -2,9 +2,14 @@ defmodule ClaudexChat.Chats.ToolCall do
   @moduledoc """
   One tool Claude asked to run, and what came of it.
 
-  A call starts `"pending"` and stays that way until a human approves or
-  denies it. `output` is what goes back to Claude as the `tool_result` — the
-  tool's return value, or the reason it didn't run.
+  A call starts `"pending"`. A human's decision makes it `"approved"` or
+  `"denied"`, and `Claudex.ToolRunner` answers it when the conversation
+  resumes: an approved call that raised ends up `"failed"`.
+
+  `result` is the `tool_result` exactly as it went back to Claude, image and
+  document blocks included, so the history replays it unchanged. It is nil
+  until the call has been answered. `output` is the same result as text, for
+  the approval card.
   """
 
   use Ecto.Schema
@@ -18,7 +23,8 @@ defmodule ClaudexChat.Chats.ToolCall do
           name: String.t(),
           input: map(),
           status: String.t(),
-          output: String.t() | nil
+          output: String.t() | nil,
+          result: map() | nil
         }
 
   @primary_key false
@@ -28,6 +34,7 @@ defmodule ClaudexChat.Chats.ToolCall do
     field :input, :map, default: %{}
     field :status, :string, default: "pending"
     field :output, :string
+    field :result, :map
   end
 
   @doc "The statuses a call can be in."
@@ -38,15 +45,15 @@ defmodule ClaudexChat.Chats.ToolCall do
   @spec pending?(t()) :: boolean()
   def pending?(%__MODULE__{status: status}), do: status == "pending"
 
-  @doc "Whether the result should go back to Claude flagged as an error."
-  @spec error?(t()) :: boolean()
-  def error?(%__MODULE__{status: status}), do: status in ~w(denied failed)
+  @doc "Whether Claude has been sent an answer to this call."
+  @spec answered?(t()) :: boolean()
+  def answered?(%__MODULE__{result: result}), do: not is_nil(result)
 
   @doc "Validates one tool call."
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(tool_call, attrs) do
     tool_call
-    |> cast(attrs, [:call_id, :name, :input, :status, :output])
+    |> cast(attrs, [:call_id, :name, :input, :status, :output, :result])
     |> validate_required([:call_id, :name, :status])
     |> validate_inclusion(:status, @statuses)
   end

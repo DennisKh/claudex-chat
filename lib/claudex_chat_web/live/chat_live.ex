@@ -3,17 +3,19 @@ defmodule ClaudexChatWeb.ChatLive do
   The chat page: history on the left, the conversation in the middle, the
   composer underneath.
 
-  A reply streams in through `Claudex.Messages.stream_to/3`, which posts events
-  to this process. Every one of those messages is matched against the handle's
-  `ref`, so a stream from a chat the user has since left can't write into the
-  one on screen.
+  The conversation runs in `Claudex.ToolRunner.stream_to/3`, which posts each
+  event and each finished turn to this process. Every one of those messages is
+  matched against the handle's `ref`, so a run from a chat the user has since
+  left can't write into the one on screen.
+
+  A run halts on a tool call nobody has decided on. Approving or denying the
+  last pending call starts the next run, which picks the conversation up from
+  the stored history.
   """
 
   use ClaudexChatWeb, :live_view
 
   import ClaudexChatWeb.ChatLive.Components
-
-  alias Claudex.Tracing
 
   alias ClaudexChat.{Approvals, Attachments, Chats, Claude, Completions, Models}
   alias ClaudexChat.Chats.Message
@@ -21,7 +23,6 @@ defmodule ClaudexChatWeb.ChatLive do
   alias ClaudexChat.Models.Model
 
   @accept ~w(.png .jpg .jpeg .gif .webp .pdf .txt .md)
-  @max_resumes 10
   @max_file_size 20_000_000
 
   @impl Phoenix.LiveView
@@ -41,11 +42,9 @@ defmodule ClaudexChatWeb.ChatLive do
        reply: nil,
        handle: nil,
        awaiting_message: nil,
-       resumes: 0,
        content: "",
        mcp_servers: [],
-       mcp_menu_open: false,
-       exchange_span: nil
+       mcp_menu_open: false
      )
      |> stream(:chats, Chats.list_chats())
      |> stream(:messages, [])
@@ -131,11 +130,10 @@ defmodule ClaudexChatWeb.ChatLive do
          {:ok, %{message: message, chat: chat}} <- Chats.replay_user_message(chat, original) do
       {:noreply,
        socket
-       |> assign(chat: chat, resumes: 0)
+       |> assign(chat: chat)
        |> stream_insert(:messages, message)
        |> stream_insert(:chats, chat, at: 0)
-       |> begin_exchange(chat)
-       |> start_stream(chat)}
+       |> start_run(chat, &Completions.start/1)}
     else
       _not_replayable -> {:noreply, socket}
     end
@@ -152,10 +150,9 @@ defmodule ClaudexChatWeb.ChatLive do
 
       {:noreply,
        socket
-       |> assign(awaiting_message: nil, reply: nil, resumes: 0)
+       |> assign(awaiting_message: nil, reply: nil)
        |> stream(:messages, Chats.list_messages(chat), reset: true)
-       |> begin_exchange(chat)
-       |> start_stream(chat)}
+       |> start_run(chat, &Completions.start/1)}
     else
       _not_retryable -> {:noreply, socket}
     end
@@ -181,22 +178,27 @@ defmodule ClaudexChatWeb.ChatLive do
   end
 
   @impl Phoenix.LiveView
-  def handle_info({:claudex, ref, {:event, event}}, %{assigns: %{handle: %{ref: ref}}} = socket) do
-    {:noreply, assign(socket, :reply, Completions.apply_event(socket.assigns.reply, event))}
+  def handle_info({:claudex, ref, {:events, events}}, %{assigns: %{handle: %{ref: ref}}} = socket) do
+    {:noreply, update(socket, :reply, &Reply.add_events(&1, events))}
+  end
+
+  def handle_info({:claudex, ref, {:turn, turn}}, %{assigns: %{handle: %{ref: ref}}} = socket) do
+    {:noreply, record_turn(socket, turn)}
   end
 
   def handle_info({:claudex, ref, :done}, %{assigns: %{handle: %{ref: ref}}} = socket) do
-    {:noreply, store_reply(socket, socket.assigns.reply)}
+    {:noreply, assign(socket, handle: nil, reply: nil)}
   end
 
+  # The turn a cancel ended has already arrived and been stored.
   def handle_info({:claudex, ref, :cancelled}, %{assigns: %{handle: %{ref: ref}}} = socket) do
-    {:noreply, store_reply(socket, Reply.cancelled(socket.assigns.reply))}
+    {:noreply, socket |> assign(handle: nil, reply: nil) |> reopen_awaiting()}
   end
 
   def handle_info({:claudex, ref, {:error, error}}, %{assigns: %{handle: %{ref: ref}}} = socket) do
-    reply = Completions.fail(socket.assigns.reply, error)
+    reply = Reply.failed(socket.assigns.reply, Completions.describe(error))
 
-    {:noreply, store_reply(socket, reply)}
+    {:noreply, record_failure(socket, reply)}
   end
 
   def handle_info({:claudex, _stale_ref, _message}, socket), do: {:noreply, socket}
@@ -206,7 +208,7 @@ defmodule ClaudexChatWeb.ChatLive do
     messages = Chats.list_messages(chat)
 
     socket
-    |> discard_exchange()
+    |> cancel_run()
     |> assign(
       chat: chat,
       model: model,
@@ -216,16 +218,25 @@ defmodule ClaudexChatWeb.ChatLive do
       page_title: chat.title
     )
     |> assign(awaiting_message: awaiting_message(messages), reply: nil, handle: nil)
-    |> stream(:messages, messages, reset: true)
+    |> stream(:messages, Chats.list_messages(chat), reset: true)
     |> stream(:chats, Chats.list_chats(), reset: true)
   end
 
   defp close_chat(socket) do
     socket
-    |> discard_exchange()
+    |> cancel_run()
     |> assign(chat: nil, reply: nil, handle: nil, awaiting_message: nil, page_title: "Chat")
     |> stream(:messages, [], reset: true)
     |> stream(:chats, Chats.list_chats(), reset: true)
+  end
+
+  # Leaving a chat stops its run: nobody is left to read the reply, and a
+  # resumed run would otherwise go on running tools.
+  defp cancel_run(%{assigns: %{handle: nil}} = socket), do: socket
+
+  defp cancel_run(%{assigns: %{handle: handle}} = socket) do
+    Completions.cancel(handle)
+    socket
   end
 
   defp apply_settings(socket, model, mode) do
@@ -284,7 +295,6 @@ defmodule ClaudexChatWeb.ChatLive do
   defp thinking_budget(_mode), do: nil
 
   defp send_prompt(socket, content) do
-    socket = assign(socket, :resumes, 0)
     {:ok, chat} = ensure_chat(socket)
     attachments = consume_attachments(socket)
 
@@ -297,8 +307,7 @@ defmodule ClaudexChatWeb.ChatLive do
     |> stream_insert(:messages, message)
     |> stream_insert(:chats, chat, at: 0)
     |> push_event("chat:sent", %{})
-    |> begin_exchange(chat)
-    |> start_stream(chat)
+    |> start_run(chat, &Completions.start/1)
   end
 
   defp ensure_chat(%{assigns: %{chat: nil}} = socket) do
@@ -313,134 +322,91 @@ defmodule ClaudexChatWeb.ChatLive do
 
   defp ensure_chat(%{assigns: %{chat: chat}}), do: {:ok, chat}
 
-  defp start_stream(socket, chat) do
-    case Completions.start(chat) do
+  defp start_run(socket, chat, run) do
+    case run.(chat) do
       {:ok, handle} ->
         assign(socket, handle: handle, reply: Reply.new(chat.model))
 
       {:error, reason} ->
-        reply = Completions.fail(Reply.new(chat.model), reason)
+        reply = Reply.failed(Reply.new(chat.model), Completions.describe(reason))
 
-        socket
-        |> assign(handle: nil, reply: nil)
-        |> store_reply(reply)
+        record_failure(socket, reply)
     end
   end
 
-  defp store_reply(socket, reply) do
-    socket = assign(socket, handle: nil, reply: nil)
+  # A turn that halted for approval leaves its reply waiting on a human. The
+  # next turn's events start a reply of their own.
+  defp record_turn(socket, turn) do
+    %{chat: chat, reply: reply, awaiting_message: awaiting} = socket.assigns
 
-    case Completions.finish(socket.assigns.chat, reply) do
+    case Completions.record_turn(chat, reply, awaiting, turn) do
       {:ok, %{message: message, chat: chat}} ->
         socket
-        |> assign(:chat, chat)
+        |> assign(chat: chat, reply: Reply.new(chat.model))
+        |> assign(:awaiting_message, if(Approvals.awaiting?(message), do: message))
         |> stream_insert(:messages, message)
-        |> continue_awaiting(message, reply)
+        |> warn_on_stop(turn.stop)
 
-      _ignored_or_failed ->
-        discard_exchange(socket)
+      {:error, _changeset} ->
+        put_flash(socket, :error, "The reply couldn't be saved.")
     end
   end
 
-  # Deciding the last pending call in a turn is what unblocks the
-  # conversation, so the next request goes out as soon as none are left.
+  defp warn_on_stop(socket, :max_turns),
+    do: put_flash(socket, :error, "Claude kept going for ten requests in a row; stopped there.")
+
+  defp warn_on_stop(socket, _stop), do: socket
+
+  # A request that failed keeps whatever arrived, and a resumed run that
+  # failed hands its calls back to the human to decide again.
+  defp record_failure(socket, reply) do
+    socket = assign(socket, handle: nil, reply: nil)
+
+    socket =
+      case Completions.record_failure(socket.assigns.chat, reply) do
+        {:ok, %{message: message, chat: chat}} ->
+          socket |> assign(:chat, chat) |> stream_insert(:messages, message)
+
+        _ignored_or_failed ->
+          socket
+      end
+
+    reopen_awaiting(socket)
+  end
+
+  defp reopen_awaiting(%{assigns: %{awaiting_message: nil}} = socket), do: socket
+
+  defp reopen_awaiting(%{assigns: %{awaiting_message: message}} = socket) do
+    {:ok, message} = Approvals.reopen(message)
+
+    socket
+    |> assign(:awaiting_message, message)
+    |> stream_insert(:messages, message)
+  end
+
+  # Deciding the last pending call in a reply is what lets the conversation
+  # go on, so the run resumes as soon as none are left.
   defp decide(socket, decision) do
     with %Message{} = awaiting <- socket.assigns.awaiting_message,
+         nil <- socket.assigns.handle,
          {:ok, message} <- decision.(awaiting) do
-      socket
-      |> stream_insert(:messages, message)
-      |> continue_or_wait(message)
+      socket = socket |> assign(:awaiting_message, message) |> stream_insert(:messages, message)
+
+      if Approvals.awaiting?(message),
+        do: socket,
+        else: start_run(socket, socket.assigns.chat, &Completions.resume(&1, message))
     else
       _nothing_to_decide -> socket
     end
   end
 
-  # Three ways a reply can end: waiting on a human, paused by the API mid
-  # server-tool, or done. Only the first stops the conversation.
-  defp continue_awaiting(socket, message, reply) do
-    cond do
-      Approvals.awaiting?(message) ->
-        assign(socket, :awaiting_message, message)
-
-      Completions.paused?(message) ->
-        socket |> assign(:awaiting_message, nil) |> resume()
-
-      true ->
-        socket
-        |> end_exchange(message, reply)
-        |> assign(awaiting_message: nil, resumes: 0)
-    end
-  end
-
-  # One span covers everything between a prompt and its answer — every resume,
-  # every wait on a human — so the requests and the tool calls it took land in
-  # one trace rather than one each.
-  defp begin_exchange(socket, chat) do
-    params = Completions.params(chat, socket.assigns.model)
-
-    span =
-      Tracing.start_conversation(params, session: to_string(chat.id), max_turns: @max_resumes)
-
-    assign(socket, :exchange_span, span)
-  end
-
-  defp end_exchange(socket, message, reply) do
-    with_span(socket, fn span ->
-      if message.error, do: Tracing.set_error(span, message.error)
-
-      Tracing.end_conversation(span, Reply.message(reply), exchange_stop(message))
-    end)
-  end
-
-  # A stream the user stopped never carried a stop reason from the API, so the
-  # app supplied one. It has to translate that back: "cancelled" is not an API
-  # reason and the SDK can only read it as :unknown.
-  defp exchange_stop(%Message{stop_reason: "cancelled"}), do: :cancelled
-  defp exchange_stop(%Message{stop_reason: reason}), do: Claudex.Message.stop(reason)
-
-  # A chat closed or switched part-way leaves a span with no answer to record,
-  # only the fact that nobody is waiting for one. Closing it is what hands it
-  # to the exporter; dropping it exports nothing.
-  defp discard_exchange(socket),
-    do: with_span(socket, &Tracing.end_conversation(&1, nil, :abandoned))
-
-  defp with_span(socket, close) do
-    case socket.assigns.exchange_span do
-      nil ->
-        socket
-
-      span ->
-        close.(span)
-        assign(socket, :exchange_span, nil)
-    end
-  end
-
-  # A pause resends the history and carries on with nobody deciding anything,
-  # so it needs its own ceiling — an API that kept pausing would otherwise
-  # loop without end. The count is of pauses in a row: a turn that ends any
-  # other way clears it.
-  defp resume(socket) do
-    if socket.assigns.resumes < @max_resumes do
-      socket
-      |> update(:resumes, &(&1 + 1))
-      |> start_stream(socket.assigns.chat)
-    else
-      put_flash(socket, :error, "Claude paused #{@max_resumes} times in a row; stopped there.")
-    end
-  end
-
-  defp continue_or_wait(socket, message) do
-    if Approvals.awaiting?(message) do
-      assign(socket, :awaiting_message, message)
-    else
-      socket
-      |> assign(awaiting_message: nil, resumes: 0)
-      |> start_stream(socket.assigns.chat)
-    end
-  end
-
   defp awaiting_message(messages) do
-    Enum.find(messages, &(&1.role == "assistant" and Approvals.awaiting?(&1)))
+    with %Message{} = message <- List.last(messages),
+         {:ok, message} <- Approvals.reopen(message) do
+      if Approvals.awaiting?(message), do: message
+    else
+      _none -> nil
+    end
   end
 
   defp consume_attachments(socket) do
