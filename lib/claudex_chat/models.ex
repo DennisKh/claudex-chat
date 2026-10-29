@@ -2,7 +2,9 @@ defmodule ClaudexChat.Models do
   @moduledoc """
   The model catalogue behind the composer's picker.
 
-  Asks the Models API once at startup and holds the answer. Until that lands —
+  Asks the Models API once at startup for every model that can still be
+  used, active or deprecated, across as many pages as there are, and holds
+  the answer. Until that lands —
   and if it fails, or no API key is configured — a built-in list is served
   instead, so the UI always has something to show. `source/0` says which one
   you're looking at.
@@ -22,6 +24,7 @@ defmodule ClaudexChat.Models do
   @fallback [
     %Model{
       id: "claude-opus-5",
+      line: "opus",
       display_name: "Claude Opus 5",
       max_output_tokens: 128_000,
       thinking_modes: ~w(off adaptive),
@@ -31,6 +34,7 @@ defmodule ClaudexChat.Models do
     },
     %Model{
       id: "claude-sonnet-5",
+      line: "sonnet",
       display_name: "Claude Sonnet 5",
       max_output_tokens: 128_000,
       thinking_modes: ~w(off adaptive),
@@ -40,6 +44,7 @@ defmodule ClaudexChat.Models do
     },
     %Model{
       id: "claude-haiku-4-5",
+      line: "haiku",
       display_name: "Claude Haiku 4.5",
       max_output_tokens: 64_000,
       thinking_modes: ~w(off enabled),
@@ -130,9 +135,15 @@ defmodule ClaudexChat.Models do
   end
 
   defp fetch_from_api do
-    with {:ok, client} <- Claude.client(),
-         {:ok, page} <- API.list(client, limit: 100) do
-      {:ok, page.data |> Enum.map(&Capabilities.to_entry/1) |> order()}
+    with {:ok, client} <- Claude.client() do
+      models =
+        client
+        |> API.stream!(lifecycle: ~w(active deprecated))
+        |> Enum.map(&Capabilities.to_entry/1)
+
+      {:ok, order(models)}
     end
+  rescue
+    error in Claudex.Error -> {:error, error}
   end
 end

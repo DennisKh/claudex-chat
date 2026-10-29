@@ -1,7 +1,8 @@
 defmodule ClaudexChat.Models.Model do
   @moduledoc """
   One model the chat can use, reduced to what the composer needs: what to call
-  it, how it takes thinking, and what it accepts as input.
+  it, which line it belongs to, how it takes thinking, what it accepts as
+  input, and whether it is on its way out.
   """
 
   @family_order ~w(fable mythos opus sonnet haiku)
@@ -13,7 +14,11 @@ defmodule ClaudexChat.Models.Model do
           thinking_modes: [String.t()],
           accepts_images: boolean(),
           accepts_pdf: boolean(),
-          accepts_code_execution: boolean()
+          accepts_code_execution: boolean(),
+          line: String.t() | nil,
+          created_at: DateTime.t() | nil,
+          lifecycle: String.t() | nil,
+          retires_at: DateTime.t() | nil
         }
 
   @enforce_keys [:id, :display_name, :max_output_tokens, :thinking_modes]
@@ -22,42 +27,41 @@ defmodule ClaudexChat.Models.Model do
     :display_name,
     :max_output_tokens,
     :thinking_modes,
+    :line,
+    :created_at,
+    :lifecycle,
+    :retires_at,
     accepts_images: false,
     accepts_pdf: false,
     accepts_code_execution: false
   ]
 
-  @doc """
-  The model's family and version, read off its id.
-
-  `"claude-opus-4-5-20251101"` is `{"opus", {4, 5}}` — a dated snapshot suffix
-  is part of the id, not the version.
-  """
-  @spec identify(t()) :: {String.t(), {integer(), integer()}}
-  def identify(%__MODULE__{id: id}) do
-    case id |> String.replace_prefix("claude-", "") |> String.split("-") do
-      [family | rest] -> {family, version(rest)}
-      [] -> {"other", {0, 0}}
-    end
-  end
-
-  @doc "The family as the picker labels it, e.g. `\"Opus\"`."
+  @doc "The model's line as the picker labels it, e.g. `\"Opus\"`."
   @spec family_label(t()) :: String.t()
-  def family_label(%__MODULE__{} = model) do
-    model |> identify() |> elem(0) |> String.capitalize()
-  end
+  def family_label(%__MODULE__{line: nil}), do: "Other"
+  def family_label(%__MODULE__{line: line}), do: String.capitalize(line)
 
   @doc """
   Sort key placing the most capable model first.
 
-  Families rank by tier, and within a family the newest version leads.
+  Lines rank by tier, and within a line the most recently released model
+  leads. A model the API gave no release date sorts last in its line.
   """
-  @spec rank(t()) :: {non_neg_integer(), integer(), integer(), String.t()}
+  @spec rank(t()) :: {non_neg_integer(), integer(), String.t()}
   def rank(%__MODULE__{} = model) do
-    {family, {major, minor}} = identify(model)
-
-    {family_rank(family), -major, -minor, model.id}
+    {line_rank(model.line), -released(model.created_at), model.id}
   end
+
+  @doc """
+  What the picker says about a model's lifecycle: when a deprecated model
+  retires, or nil for one that is active.
+  """
+  @spec lifecycle_note(t()) :: String.t() | nil
+  def lifecycle_note(%__MODULE__{lifecycle: "deprecated", retires_at: %DateTime{} = at}),
+    do: "retires #{Calendar.strftime(at, "%Y-%m-%d")}"
+
+  def lifecycle_note(%__MODULE__{lifecycle: "deprecated"}), do: "deprecated"
+  def lifecycle_note(%__MODULE__{}), do: nil
 
   @doc "Whether the model can be asked to think in this mode."
   @spec supports_thinking?(t(), String.t()) :: boolean()
@@ -72,22 +76,8 @@ defmodule ClaudexChat.Models.Model do
     images ++ documents ++ ~w(text/plain text/markdown)
   end
 
-  defp family_rank(family) do
-    Enum.find_index(@family_order, &(&1 == family)) || length(@family_order)
-  end
+  defp line_rank(line), do: Enum.find_index(@family_order, &(&1 == line)) || length(@family_order)
 
-  defp version(segments) do
-    case segments |> Enum.flat_map(&number/1) |> Enum.reject(&(&1 >= 10_000)) do
-      [major, minor | _rest] -> {major, minor}
-      [major] -> {major, 0}
-      [] -> {0, 0}
-    end
-  end
-
-  defp number(segment) do
-    case Integer.parse(segment) do
-      {number, ""} -> [number]
-      _not_a_number -> []
-    end
-  end
+  defp released(nil), do: 0
+  defp released(%DateTime{} = at), do: DateTime.to_unix(at)
 end

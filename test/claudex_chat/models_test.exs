@@ -70,4 +70,42 @@ defmodule ClaudexChat.ModelsTest do
       assert "text/plain" in Model.accepted_types(text_only)
     end
   end
+
+  describe "rank/1 and lifecycle_note/1" do
+    defp entry(id, line, created_at, attrs \\ %{}) do
+      struct!(
+        %Model{id: id, display_name: id, max_output_tokens: 1000, thinking_modes: ["off"]},
+        Map.merge(%{line: line, created_at: created_at}, attrs)
+      )
+    end
+
+    test "orders by line, then the most recently released first" do
+      models = [
+        entry("claude-haiku-4-5", "haiku", ~U[2025-10-01 00:00:00Z]),
+        entry("claude-opus-4-8", "opus", ~U[2026-05-01 00:00:00Z]),
+        entry("claude-opus-5-5", "opus", ~U[2026-09-21 00:00:00Z]),
+        entry("claude-fable-5-1", "fable", ~U[2026-08-01 00:00:00Z])
+      ]
+
+      assert models |> Enum.sort_by(&Model.rank/1) |> Enum.map(& &1.id) ==
+               ~w(claude-fable-5-1 claude-opus-5-5 claude-opus-4-8 claude-haiku-4-5)
+    end
+
+    test "says when a deprecated model retires, and nothing for an active one" do
+      deprecated =
+        entry("old", "opus", nil, %{lifecycle: "deprecated", retires_at: ~U[2027-01-15 00:00:00Z]})
+
+      assert Model.lifecycle_note(deprecated) == "retires 2027-01-15"
+      assert Model.lifecycle_note(%{deprecated | retires_at: nil}) == "deprecated"
+      assert Model.lifecycle_note(entry("new", "opus", nil, %{lifecycle: "active"})) == nil
+    end
+
+    test "reads the line, release date and lifecycle off the Models API" do
+      entry = "model.json" |> decoded() |> APIModel.decode() |> Capabilities.to_entry()
+
+      assert entry.line == "haiku"
+      assert %DateTime{} = entry.created_at
+      assert Model.family_label(entry) == "Haiku"
+    end
+  end
 end

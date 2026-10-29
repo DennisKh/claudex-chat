@@ -24,7 +24,11 @@ defmodule ClaudexChat.Models.Capabilities do
       thinking_modes: thinking_modes(model),
       accepts_images: Model.supports?(model, "image_input"),
       accepts_pdf: Model.supports?(model, "pdf_input"),
-      accepts_code_execution: Model.supports?(model, "code_execution")
+      accepts_code_execution: Model.supports?(model, "code_execution"),
+      line: model.line,
+      created_at: model.created_at,
+      lifecycle: model.lifecycle,
+      retires_at: model.retires_at
     }
   end
 
