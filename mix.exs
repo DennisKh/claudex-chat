@@ -41,7 +41,7 @@ defmodule ClaudexChat.MixProject do
   defp deps do
     [
       {:phoenix, "~> 1.8.13"},
-      {:claudex, path: "../claudex"},
+      {:claudex, "~> 0.11"},
       {:mdex, "~> 0.13.5"},
       {:phoenix_ecto, "~> 4.5"},
       {:ecto_sql, "~> 3.13"},

@@ -25,7 +25,7 @@ No authentication, no accounts, no user records, no scopes, no multi-tenancy, no
 | HTTP client | Req (never HTTPoison, Tesla, or httpc) |
 | Server | Bandit |
 | CSS | Tailwind v4 (no `tailwind.config.js`), heroicons via `<.icon>` |
-| SDK | `{:claudex, "~> 0.10"}` from Hex |
+| SDK | `{:claudex, "~> 0.11"}` from Hex |
 
 Use the Hex release of Claudex. Switch to `{:claudex, path: "../claudex"}` only to exercise an unreleased SDK change, and say so in the commit — a demo that only builds against a working copy isn't a demo.
 
