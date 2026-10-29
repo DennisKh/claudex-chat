@@ -127,14 +127,14 @@ defmodule ClaudexChat.Chats do
 
   This is what a retry rewinds to: the reply being retried goes, and so does
   anything that followed it, because it was answering a turn that no longer
-  exists.
+  exists. Returns the messages it deleted, so a page can take out just those.
   """
-  @spec discard_from(Message.t()) :: {:ok, non_neg_integer()}
+  @spec discard_from(Message.t()) :: {:ok, [Message.t()]}
   def discard_from(%Message{chat_id: chat_id, id: id}) do
-    {count, _deleted} =
-      Repo.delete_all(from m in Message, where: m.chat_id == ^chat_id and m.id >= ^id)
+    {_count, deleted} =
+      Repo.delete_all(from(m in Message, where: m.chat_id == ^chat_id and m.id >= ^id, select: m))
 
-    {:ok, count}
+    {:ok, deleted}
   end
 
   @doc """

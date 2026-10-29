@@ -262,7 +262,8 @@ defmodule ClaudexChat.ChatsTest do
       {:ok, %{chat: chat}} = Chats.add_user_message(chat, %{content: "Three"})
       {:ok, _} = Chats.add_assistant_message(chat, %{content: "Four"})
 
-      assert {:ok, 3} = Chats.discard_from(reply)
+      assert {:ok, discarded} = Chats.discard_from(reply)
+      assert discarded |> Enum.map(& &1.content) |> Enum.sort() == ~w(Four Three Two)
       assert ["One"] = Enum.map(Chats.list_messages(chat), & &1.content)
     end
 
@@ -273,7 +274,8 @@ defmodule ClaudexChat.ChatsTest do
       chat = chat()
       {:ok, %{message: message}} = Chats.add_user_message(chat, %{content: "Drop me"})
 
-      assert {:ok, 1} = Chats.discard_from(message)
+      assert {:ok, [%{id: id}]} = Chats.discard_from(message)
+      assert id == message.id
       assert {:ok, _} = Chats.fetch_message(kept.id)
     end
   end

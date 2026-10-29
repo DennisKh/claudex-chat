@@ -145,13 +145,18 @@ defmodule ClaudexChatWeb.ChatLive do
     with {:ok, message} <- Chats.fetch_message(id),
          %{id: chat_id} <- socket.assigns.chat,
          true <- message.chat_id == chat_id,
-         {:ok, _count} <- Chats.discard_from(message) do
+         {:ok, discarded} <- Chats.discard_from(message) do
       chat = socket.assigns.chat
 
+      # Only the discarded messages leave the page. Resetting the whole list
+      # would empty the conversation for a moment, and the browser would
+      # scroll it back to the top.
       {:noreply,
        socket
        |> assign(awaiting_message: nil, reply: nil)
-       |> stream(:messages, Chats.list_messages(chat), reset: true)
+       |> then(
+         &Enum.reduce(discarded, &1, fn gone, socket -> stream_delete(socket, :messages, gone) end)
+       )
        |> start_run(chat, &Completions.start/1)}
     else
       _not_retryable -> {:noreply, socket}
